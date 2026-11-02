@@ -1,6 +1,26 @@
 const ExcelJS = require('exceljs');
 
 /**
+ * Sanitize cell values against Excel formula injection (CSV/Excel DDE attacks)
+ * Characters =, +, -, @, \t, \r at start of strings force formula evaluation in Excel.
+ */
+function sanitizeCell(val) {
+  if (typeof val !== 'string') return val;
+  if (/^[\=\+\-\@\t\r]/.test(val)) {
+    return `'${val}`;
+  }
+  return val;
+}
+
+function sanitizeOrderRow(order) {
+  const sanitized = {};
+  for (const [key, val] of Object.entries(order)) {
+    sanitized[key] = sanitizeCell(val);
+  }
+  return sanitized;
+}
+
+/**
  * Generate a production warehouse pick-and-pack Excel spreadsheet buffer
  * @param {Array} orders - Array of normalized order items
  * @param {string} shopDomain - Store domain (e.g. hk-mart-cfoepmjd.myshopify.com)
@@ -59,7 +79,8 @@ async function generateOrdersWorkbook(orders, shopDomain = 'store') {
     emptyRow.font = { italic: true, color: { argb: 'FF64748B' } };
   } else {
     orders.forEach((order, index) => {
-      const row = worksheet.addRow(order);
+      const sanitized = sanitizeOrderRow(order);
+      const row = worksheet.addRow(sanitized);
       // Alternating row background for warehouse legibility
       if (index % 2 === 1) {
         row.fill = {
@@ -79,5 +100,6 @@ async function generateOrdersWorkbook(orders, shopDomain = 'store') {
 }
 
 module.exports = {
-  generateOrdersWorkbook
+  generateOrdersWorkbook,
+  sanitizeCell
 };

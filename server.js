@@ -3,6 +3,7 @@ const express = require('express');
 const https = require('https');
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const selfsigned = require('selfsigned');
@@ -19,6 +20,7 @@ const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const APP_URL = process.env.APP_URL || 'https://orderdrop.onrender.com';
 const CRON_SECRET = process.env.CRON_SECRET || 'orderdrop_cron_secret_secure_key';
+const SESSION_SECRET = CLIENT_SECRET || 'orderdrop_production_session_secure_key';
 
 // Disable X-Powered-By
 app.disable('x-powered-by');
@@ -76,12 +78,31 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
+// Authentication Middleware for API endpoints (prevents tenant IDOR & token leaks)
+function verifyShopAuth(req, res, next) {
+  const shop = req.body.shop || req.query.shop;
+  const token = req.headers['x-orderdrop-token'] || req.query.token;
+
+  if (!shop || !shopify.isValidShopDomain(shop)) {
+    return res.status(400).json({ success: false, error: 'Invalid or missing shop domain format.' });
+  }
+
+  const hasValidToken = shopify.verifySessionToken(token, shop, SESSION_SECRET);
+  const hasValidHmac = req.query.hmac && shopify.verifyHmac(req.query, SESSION_SECRET);
+
+  if (!hasValidToken && !hasValidHmac) {
+    return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or expired session credentials.' });
+  }
+
+  next();
+}
+
 // Ensure default test store is registered in db if present
 const DEFAULT_SHOP = process.env.SHOP_DOMAIN || 'hk-mart-cfoepmjd.myshopify.com';
 if (!db.getShop(DEFAULT_SHOP)) {
   db.saveShop(DEFAULT_SHOP, {
     shop: DEFAULT_SHOP,
-    recipientEmail: process.env.MERCHANT_EMAIL || 'www.sunitajoshi98765@gmail.com',
+    recipientEmail: process.env.MERCHANT_EMAIL || '',
     plan: 'Starter ($9.99/mo)',
     subscriptionStatus: 'active'
   });
@@ -95,21 +116,24 @@ app.get('/', async (req, res) => {
   const isEmbedded = req.query.embedded === '1' || req.query.host || Boolean(shopQuery);
 
   if (isEmbedded && shopQuery) {
-    const cleanShop = escapeHtml(shopQuery);
-    let shopData = db.getShop(cleanShop);
+    if (!shopify.isValidShopDomain(shopQuery)) {
+      return res.status(400).send('<h3>Invalid store domain. Please provide a valid .myshopify.com address.</h3>');
+    }
 
-    // If HMAC is provided, verify it
-    if (req.query.hmac && CLIENT_SECRET) {
+    const cleanShop = shopQuery.toLowerCase().trim();
+
+    // Verify HMAC when coming from Shopify embedded admin
+    if (CLIENT_SECRET && (req.query.hmac || req.query.embedded)) {
       const isValidHmac = shopify.verifyHmac(req.query, CLIENT_SECRET);
       if (!isValidHmac) {
-        return res.status(401).send('<h3>Unauthorized: Invalid Shopify signature</h3>');
+        return res.status(401).send('<h3>Unauthorized: Invalid Shopify HMAC signature</h3>');
       }
     }
 
+    let shopData = db.getShop(cleanShop);
     if (!shopData) {
       shopData = db.saveShop(cleanShop, {
-        shop: cleanShop,
-        recipientEmail: process.env.MERCHANT_EMAIL || 'www.sunitajoshi98765@gmail.com'
+        shop: cleanShop
       });
     }
 
@@ -124,7 +148,8 @@ app.get('/', async (req, res) => {
       }
     }
 
-    return res.send(renderDashboard(shopData, orders, fetchError));
+    const sessionToken = shopify.createSessionToken(cleanShop, SESSION_SECRET);
+    return res.send(renderDashboard(shopData, orders, fetchError, sessionToken));
   }
 
   return res.send(renderLandingPage());
@@ -140,9 +165,14 @@ app.get('/auth', (req, res) => {
   }
 
   const cleanShop = shop.replace(/^https?:\/\//, '').replace(/\/.*$/, '').toLowerCase().trim();
+  if (!shopify.isValidShopDomain(cleanShop)) {
+    return res.status(400).send('Security error: Invalid shop domain format.');
+  }
+
+  const stateNonce = crypto.randomBytes(16).toString('hex');
   const redirectUri = `${APP_URL}/auth/callback`;
   const scopes = 'read_orders,write_orders';
-  const installUrl = `https://${cleanShop}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}&state=orderdrop_auth_state`;
+  const installUrl = `https://${cleanShop}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${stateNonce}`;
 
   res.redirect(installUrl);
 });
@@ -154,12 +184,18 @@ app.get('/auth/callback', async (req, res) => {
     return res.status(400).send('Invalid OAuth callback: missing shop or code.');
   }
 
-  // 1. Verify HMAC Signature
-  if (CLIENT_SECRET && hmac) {
-    const isValid = shopify.verifyHmac(req.query, CLIENT_SECRET);
-    if (!isValid) {
-      return res.status(400).send('Security check failed: HMAC verification failed.');
-    }
+  if (!shopify.isValidShopDomain(shop)) {
+    return res.status(400).send('Security check failed: Invalid shop domain format.');
+  }
+
+  // 1. Strictly verify HMAC Signature
+  if (!hmac || !CLIENT_SECRET) {
+    return res.status(400).send('Security check failed: Missing security credentials.');
+  }
+
+  const isValid = shopify.verifyHmac(req.query, CLIENT_SECRET);
+  if (!isValid) {
+    return res.status(400).send('Security check failed: HMAC verification failed.');
   }
 
   try {
@@ -180,7 +216,6 @@ app.get('/auth/callback', async (req, res) => {
     console.log(`[OAuth] Successfully authenticated shop: ${shop}`);
 
     // 4. Redirect into Shopify Admin Embedded App
-    const host = req.query.host || Buffer.from(`admin.shopify.com/store/${shop.replace('.myshopify.com', '')}`).toString('base64');
     res.redirect(`https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/apps/orderdrop-1`);
   } catch (err) {
     console.error('[OAuth] Token exchange error:', err.message);
@@ -202,7 +237,8 @@ app.get('/api/billing/subscribe', async (req, res) => {
 
   try {
     const returnUrl = `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shop)}&plan=${planType}`;
-    const subscription = await shopify.createAppSubscription(shop, shopData.accessToken, returnUrl, true, planType);
+    const isTestFlag = process.env.SHOPIFY_BILLING_TEST === 'true' || process.env.NODE_ENV !== 'production';
+    const subscription = await shopify.createAppSubscription(shop, shopData.accessToken, returnUrl, isTestFlag, planType);
 
     if (subscription.confirmationUrl) {
       return res.redirect(subscription.confirmationUrl);
@@ -214,11 +250,21 @@ app.get('/api/billing/subscribe', async (req, res) => {
   }
 });
 
-app.get('/api/billing/confirm', (req, res) => {
+app.get('/api/billing/confirm', async (req, res) => {
   const shop = req.query.shop || DEFAULT_SHOP;
   const chargeId = req.query.charge_id;
   const planType = req.query.plan === 'annual' ? 'annual' : 'monthly';
   const planLabel = planType === 'annual' ? 'Annual Plan ($99.99/yr)' : 'Monthly Plan ($9.99/mo)';
+  const shopData = db.getShop(shop);
+
+  if (shopData?.accessToken) {
+    try {
+      const activeCheck = await shopify.checkActiveSubscription(shop, shopData.accessToken);
+      console.log(`[Billing] Confirmed subscriptions for ${shop}:`, activeCheck.subscriptions);
+    } catch (err) {
+      console.warn('[Billing] GraphQL verification note:', err.message);
+    }
+  }
 
   db.saveShop(shop, {
     subscriptionStatus: 'active',
@@ -229,15 +275,28 @@ app.get('/api/billing/confirm', (req, res) => {
   res.redirect(`/?shop=${encodeURIComponent(shop)}&billing=confirmed`);
 });
 
+// -------------------------------------------------------------
 // 4. MERCHANT API ENDPOINTS (AUTHENTICATED & RATE-LIMITED)
 // -------------------------------------------------------------
 app.use('/api', apiLimiter);
 
-// Direct Excel Download Endpoint
+// Direct Excel Download Endpoint (Secured by Session Token or HMAC)
 app.get('/api/export', async (req, res) => {
   const shop = req.query.shop || DEFAULT_SHOP;
-  const shopData = db.getShop(shop);
+  const token = req.query.token;
 
+  if (!shopify.isValidShopDomain(shop)) {
+    return res.status(400).json({ error: 'Invalid store domain format' });
+  }
+
+  const isValidToken = shopify.verifySessionToken(token, shop, SESSION_SECRET);
+  const isValidHmac = req.query.hmac && shopify.verifyHmac(req.query, SESSION_SECRET);
+
+  if (!isValidToken && !isValidHmac) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid or expired download credentials' });
+  }
+
+  const shopData = db.getShop(shop);
   if (!shopData) {
     return res.status(404).json({ error: 'Store not found' });
   }
@@ -261,8 +320,8 @@ app.get('/api/export', async (req, res) => {
   }
 });
 
-// Send Dispatch Email Now Endpoint (Strictly Rate-Limited)
-app.post('/api/send-email', emailLimiter, async (req, res) => {
+// Send Dispatch Email Now Endpoint (Strictly Rate-Limited & Authenticated)
+app.post('/api/send-email', emailLimiter, verifyShopAuth, async (req, res) => {
   const shop = req.body.shop || DEFAULT_SHOP;
   const emailOverride = req.body.email;
 
@@ -279,8 +338,8 @@ app.post('/api/send-email', emailLimiter, async (req, res) => {
   }
 });
 
-// Update Store Schedule Settings Endpoint
-app.post('/api/settings', (req, res) => {
+// Update Store Schedule Settings Endpoint (Authenticated & Token-Sanitized)
+app.post('/api/settings', verifyShopAuth, (req, res) => {
   const shop = req.body.shop || DEFAULT_SHOP;
   const shopData = db.getShop(shop);
 
@@ -290,11 +349,13 @@ app.post('/api/settings', (req, res) => {
 
   const updates = {};
   if (req.body.scheduleTime) updates.scheduleTime = req.body.scheduleTime;
-  if (req.body.recipientEmail) updates.recipientEmail = req.body.recipientEmail;
+  if (req.body.recipientEmail !== undefined) updates.recipientEmail = req.body.recipientEmail.trim();
   if (typeof req.body.autoDispatchEnabled === 'boolean') updates.autoDispatchEnabled = req.body.autoDispatchEnabled;
 
   const updated = db.saveShop(shop, updates);
-  res.json({ success: true, config: updated });
+  // Strip private tokens before returning to client
+  const { accessToken, scopes, ...safeConfig } = updated;
+  res.json({ success: true, config: safeConfig });
 });
 
 // External Cron Trigger Endpoint (Protected by CRON_SECRET)
@@ -384,7 +445,7 @@ app.get('/privacy', (req, res) => {
     <h3>3. Data Retention & Deletion</h3>
     <p>When you uninstall OrderDrop, our webhook immediately deactivates automated dispatches and deletes store tokens. You may request complete erasure at any time by contacting support.</p>
     <h3>4. Contact</h3>
-    <p>For privacy inquiries: <a href="mailto:www.sunitajoshi98765@gmail.com">support@orderdrop.com</a></p>
+    <p>For privacy inquiries: <a href="mailto:support@orderdrop.store">support@orderdrop.store</a></p>
   `));
 });
 
@@ -393,7 +454,7 @@ app.get('/terms', (req, res) => {
     <h3>1. Services Provided</h3>
     <p>OrderDrop provides automated daily export of unfulfilled Shopify orders via email attachments.</p>
     <h3>2. Billing & Subscriptions</h3>
-    <p>Subscriptions are billed on a 30-day recurring basis through Shopify Billing. All plans include a 7-day free trial. Cancellation takes effect immediately upon app removal.</p>
+    <p>Subscriptions are billed through Shopify Billing. All plans include a 7-day free trial. Cancellation takes effect immediately upon app removal.</p>
     <h3>3. Limitation of Liability</h3>
     <p>OrderDrop is provided "as is". Merchants are responsible for ensuring recipient email addresses are correct and up-to-date.</p>
   `));
@@ -403,16 +464,16 @@ app.get('/support', (req, res) => {
   res.send(renderLegalPage('OrderDrop Support & Help Center', `
     <p>Need assistance with your daily orders dispatch schedule, column formatting, or warehouse email configuration?</p>
     <div style="background: #f1f5f9; padding: 18px; border-radius: 8px; margin: 20px 0;">
-      <p style="margin: 0; font-size: 15px;"><strong>Official Support Email:</strong> <a href="mailto:www.sunitajoshi98765@gmail.com">www.sunitajoshi98765@gmail.com</a></p>
+      <p style="margin: 0; font-size: 15px;"><strong>Official Support Email:</strong> <a href="mailto:support@orderdrop.store">support@orderdrop.store</a></p>
       <p style="margin: 8px 0 0; font-size: 13px; color: #64748b;">Typical response time: Under 12 hours</p>
     </div>
   `));
 });
 
 // -------------------------------------------------------------
-// 7. HTML TEMPLATES (ESCAPE-SANITIZED)
+// 7. HTML TEMPLATES (POLARIS-ALIGNED & ESCAPE-SANITIZED)
 // -------------------------------------------------------------
-function renderDashboard(shopData, orders = [], fetchError = null) {
+function renderDashboard(shopData, orders = [], fetchError = null, sessionToken = '') {
   const shop = escapeHtml(shopData.shop);
   const recipient = escapeHtml(shopData.recipientEmail || '');
   const scheduleTime = escapeHtml(shopData.scheduleTime || '18:00');
@@ -424,6 +485,15 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
   if (shopData.trialEndsAt) {
     const daysLeft = Math.max(0, Math.ceil((new Date(shopData.trialEndsAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
     trialText = `Trial: ${daysLeft} day${daysLeft === 1 ? '' : 's'} left`;
+  }
+
+  // Generate 24-hour UTC dropdown options
+  let timeOptions = '';
+  for (let h = 0; h < 24; h++) {
+    const val = String(h).padStart(2, '0') + ':00';
+    const ampm = h === 0 ? '12:00 AM' : h < 12 ? `${h}:00 AM` : h === 12 ? '12:00 PM' : `${h - 12}:00 PM`;
+    const selected = scheduleTime === val ? 'selected' : '';
+    timeOptions += `<option value="${val}" ${selected}>Daily at ${val} UTC (${ampm} UTC)</option>\n`;
   }
 
   let tableRows = '';
@@ -448,6 +518,11 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
       </tr>
     `).join('');
   }
+
+  const lastDispatchedStr = shopData.lastDispatchedAt 
+    ? new Date(shopData.lastDispatchedAt).toUTCString()
+    : 'No dispatches recorded yet';
+  const lastStatus = shopData.lastDispatchStatus || 'Ready';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -493,7 +568,7 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
         <h2 style="font-size: 16px; margin: 0 0 4px; font-weight: 600;">Today's Unfulfilled Orders (${orderCount})</h2>
         <p style="margin: 0; color: #6d7175; font-size: 13px;">Live order stream queried directly from your Shopify store.</p>
       </div>
-      <a href="/api/export?shop=${encodeURIComponent(shop)}" class="btn">
+      <a href="/api/export?shop=${encodeURIComponent(shop)}&token=${encodeURIComponent(sessionToken)}" class="btn">
         <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
         Download Excel (.xlsx)
       </a>
@@ -523,22 +598,25 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
         <h2 style="font-size: 16px; margin: 0 0 4px; font-weight: 600;">Autonomous Daily Email Schedule</h2>
         <p style="margin: 0; color: #6d7175; font-size: 13px;">Automatically compiles unfulfilled orders and emails your warehouse or 3PL every day.</p>
       </div>
-      <span style="font-size: 12px; color: #008060; font-weight: 600;">● Multi-Tenant Scheduler Ready</span>
+      <div style="text-align: right; font-size: 12px; color: #6d7175;">
+        <span>Last Dispatch: <strong>${escapeHtml(lastDispatchedStr)}</strong></span>
+        <br><span style="color: ${lastStatus === 'success' ? '#008060' : '#b91c1c'}; font-weight: 600;">● ${escapeHtml(lastStatus)}</span>
+      </div>
     </div>
 
     <div class="grid">
       <div>
         <label style="font-size: 13px; font-weight: 600;">Daily Delivery Time (UTC)</label>
         <select id="scheduleTime">
-          <option value="18:00" ${scheduleTime === '18:00' ? 'selected' : ''}>Every day at 06:00 PM (18:00 UTC)</option>
-          <option value="09:00" ${scheduleTime === '09:00' ? 'selected' : ''}>Every day at 09:00 AM (09:00 UTC)</option>
-          <option value="23:59" ${scheduleTime === '23:59' ? 'selected' : ''}>Every night at Midnight (23:59 UTC)</option>
+          ${timeOptions}
         </select>
+        <p style="font-size: 11px; color: #6d7175; margin: 4px 0 0;">Pick your preferred daily cut-off time (UTC).</p>
       </div>
 
       <div>
-        <label style="font-size: 13px; font-weight: 600;">Warehouse / Supplier Email</label>
+        <label style="font-size: 13px; font-weight: 600;">Warehouse / Supplier Recipient Email</label>
         <input type="email" id="recipientEmail" placeholder="warehouse@example.com" value="${recipient}" />
+        <p style="font-size: 11px; color: #6d7175; margin: 4px 0 0;">The destination inbox where .xlsx files are delivered.</p>
       </div>
     </div>
 
@@ -569,7 +647,7 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
         <div style="font-weight: 700; font-size: 15px; margin-bottom: 4px;">Monthly Plan</div>
         <div style="font-size: 24px; font-weight: 800; color: #008060; margin-bottom: 6px;">$9.99 <span style="font-size: 13px; font-weight: 400; color: #64748b;">/ month</span></div>
         <p style="font-size: 12px; color: #64748b; margin: 0 0 14px; min-height: 32px;">Includes full 7-day free trial. Billed every 30 days via Shopify. Cancel anytime with zero fees.</p>
-        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=monthly" class="btn btn-secondary" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Monthly ($9.99/mo)</a>
+        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=monthly" target="_top" class="btn btn-secondary" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Monthly ($9.99/mo)</a>
       </div>
 
       <div style="border: 2px solid #008060; border-radius: 8px; padding: 18px; background: #f0fdf4; position: relative;">
@@ -577,7 +655,7 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
         <div style="font-weight: 700; font-size: 15px; margin-bottom: 4px;">Annual Plan</div>
         <div style="font-size: 24px; font-weight: 800; color: #008060; margin-bottom: 6px;">$99.99 <span style="font-size: 13px; font-weight: 400; color: #64748b;">/ year</span></div>
         <p style="font-size: 12px; color: #166534; margin: 0 0 14px; min-height: 32px;">Includes full 7-day free trial. ~$8.33/mo. Best value for high-volume and scaling merchants.</p>
-        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=annual" class="btn" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Annual ($99.99/yr)</a>
+        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=annual" target="_top" class="btn" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Annual ($99.99/yr)</a>
       </div>
     </div>
     ` : `
@@ -592,21 +670,32 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
 
   <script>
     const currentShop = "${shop}";
+    const sessionToken = "${sessionToken}";
 
     async function saveSchedule() {
-      const email = document.getElementById('recipientEmail').value;
+      const email = document.getElementById('recipientEmail').value.trim();
       const time = document.getElementById('scheduleTime').value;
       const toast = document.getElementById('toast');
       
       try {
         const res = await fetch('/api/settings', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ shop: currentShop, recipientEmail: email, scheduleTime: time, autoDispatchEnabled: true })
+          headers: { 
+            'Content-Type': 'application/json',
+            'x-orderdrop-token': sessionToken
+          },
+          body: JSON.stringify({ 
+            shop: currentShop, 
+            recipientEmail: email, 
+            scheduleTime: time, 
+            autoDispatchEnabled: Boolean(email) 
+          })
         });
         const data = await res.json();
         if (data.success) {
-          toast.innerText = "Schedule saved! Orders will automatically export daily at " + time + " UTC to " + email;
+          toast.innerText = email 
+            ? "Schedule saved! Orders will export daily at " + time + " UTC to " + email
+            : "Settings saved! Please enter a recipient email to enable automated dispatches.";
         } else {
           toast.innerText = "Error: " + (data.error || 'Failed to update');
         }
@@ -618,15 +707,25 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
     }
 
     async function testEmail() {
-      const email = document.getElementById('recipientEmail').value;
+      const email = document.getElementById('recipientEmail').value.trim();
       const toast = document.getElementById('toast');
+      if (!email) {
+        toast.innerText = "Please enter a recipient email address first.";
+        toast.style.display = 'block';
+        setTimeout(() => { toast.style.display = 'none'; }, 4000);
+        return;
+      }
+
       toast.innerText = "Dispatching real spreadsheet to " + email + "...";
       toast.style.display = 'block';
 
       try {
         const res = await fetch('/api/send-email', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'x-orderdrop-token': sessionToken
+          },
           body: JSON.stringify({ shop: currentShop, email: email })
         });
         const data = await res.json();
@@ -749,24 +848,34 @@ function renderLegalPage(title, content) {
 // -------------------------------------------------------------
 // 8. SERVER INITIALIZATION & BACKGROUND SCHEDULER
 // -------------------------------------------------------------
-scheduler.startCron();
-
 const PORT = process.env.PORT || 3000;
 
-if (process.env.NODE_ENV === 'production' || process.env.RENDER) {
-  app.listen(PORT, () => {
-    console.log(`[OrderDrop Production] Server running on port ${PORT}`);
-  });
-} else {
-  // Local Development
-  const attrs = [{ name: 'commonName', value: 'localhost' }];
-  const pems = selfsigned.generate(attrs, { days: 365 });
+// Initialize Postgres cache and start scheduler
+(async () => {
+  try {
+    await db.init();
+    console.log('[OrderDrop] Database initialized successfully.');
+  } catch (err) {
+    console.error('[OrderDrop] DB init warning:', err.message);
+  }
 
-  https.createServer({ key: pems.private, cert: pems.cert }, app).listen(3000, () => {
-    console.log(`[OrderDrop] HTTPS Server running at https://localhost:3000`);
-  });
+  scheduler.startCron();
 
-  http.createServer(app).listen(3001, () => {
-    console.log(`[OrderDrop] HTTP Server running at http://localhost:3001`);
-  });
-}
+  if (process.env.NODE_ENV === 'production' || process.env.RENDER) {
+    app.listen(PORT, () => {
+      console.log(`[OrderDrop Production] Server running on port ${PORT}`);
+    });
+  } else {
+    // Local Development
+    const attrs = [{ name: 'commonName', value: 'localhost' }];
+    const pems = selfsigned.generate(attrs, { days: 365 });
+
+    https.createServer({ key: pems.private, cert: pems.cert }, app).listen(3000, () => {
+      console.log(`[OrderDrop] HTTPS Server running at https://localhost:3000`);
+    });
+
+    http.createServer(app).listen(3001, () => {
+      console.log(`[OrderDrop] HTTP Server running at http://localhost:3001`);
+    });
+  }
+})();

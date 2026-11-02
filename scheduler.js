@@ -14,7 +14,7 @@ async function runDispatchForShop(shopDomain, recipientOverride = null) {
   }
 
   const recipient = recipientOverride || shopData.recipientEmail;
-  if (!recipient) {
+  if (!recipient || !recipient.trim()) {
     throw new Error(`No recipient email configured for shop "${shopDomain}".`);
   }
 
@@ -27,8 +27,11 @@ async function runDispatchForShop(shopDomain, recipientOverride = null) {
       orders = await shopify.fetchUnfulfilledOrders(shopData.shop, shopData.accessToken);
     } catch (err) {
       console.error(`[Scheduler] Failed to fetch live orders for ${shopDomain}:`, err.message);
-      // Fallback: If store has sample order or is dev store, generate clean report
-      orders = [];
+      db.saveShop(shopDomain, {
+        lastDispatchStatus: `error: ${err.message}`,
+        lastDispatchedAt: new Date().toISOString()
+      });
+      throw new Error(`Order fetch failed: ${err.message}. Aborting dispatch to prevent sending inaccurate data.`);
     }
   } else {
     console.log(`[Scheduler] No access token for ${shopDomain}, generating empty template.`);
@@ -48,7 +51,7 @@ async function runDispatchForShop(shopDomain, recipientOverride = null) {
     filename: filename
   });
 
-  // Update last dispatch timestamp
+  // Update last dispatch timestamp & metrics
   db.saveShop(shopDomain, {
     lastDispatchedAt: new Date().toISOString(),
     lastOrderCount: orders.length,
@@ -73,11 +76,9 @@ async function runScheduledPass() {
 
   const now = new Date();
   const currentHour = String(now.getUTCHours()).padStart(2, '0');
-  const currentMinute = String(now.getUTCMinutes()).padStart(2, '0');
-  const currentTime = `${currentHour}:${currentMinute}`;
 
   for (const shop of activeShops) {
-    // Check if store's schedule matches current UTC time (matching within 15-minute window)
+    // Check if store's schedule matches current UTC time (matching hourly window)
     const targetTime = shop.scheduleTime || '18:00';
     const [targetHour] = targetTime.split(':');
     
@@ -87,7 +88,8 @@ async function runScheduledPass() {
       lastDispatched.getUTCFullYear() === now.getUTCFullYear() &&
       lastDispatched.getUTCMonth() === now.getUTCMonth() &&
       lastDispatched.getUTCDate() === now.getUTCDate() &&
-      lastDispatched.getUTCHours() === now.getUTCHours();
+      lastDispatched.getUTCHours() === now.getUTCHours() &&
+      shop.lastDispatchStatus === 'success';
 
     if (currentHour === targetHour && !dispatchedToday) {
       console.log(`[Scheduler] Executing scheduled daily dispatch for ${shop.shop}...`);
@@ -95,7 +97,10 @@ async function runScheduledPass() {
         await runDispatchForShop(shop.shop);
       } catch (err) {
         console.error(`[Scheduler] Error in scheduled run for ${shop.shop}:`, err.message);
-        db.saveShop(shop.shop, { lastDispatchStatus: 'error: ' + err.message });
+        db.saveShop(shop.shop, { 
+          lastDispatchStatus: 'error: ' + err.message,
+          lastDispatchedAt: new Date().toISOString()
+        });
       }
     }
   }

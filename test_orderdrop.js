@@ -2,7 +2,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const db = require('./db');
 const shopify = require('./shopify');
-const { generateOrdersWorkbook } = require('./export_engine');
+const { generateOrdersWorkbook, sanitizeCell } = require('./export_engine');
 
 async function runTests() {
   console.log('--- [OrderDrop Test Suite] Starting Verification ---');
@@ -117,6 +117,57 @@ async function runTests() {
     assert(Buffer.isBuffer(buffer));
     assert(buffer.length > 2000);
     assert(filename.includes('hk-mart_Orders_'));
+  });
+
+  // Test 6: Security - Subdomain Validation (SSRF & Redirection attack defense)
+  test('Security: Shop domain regex validation strictly permits valid myshopify domains', () => {
+    assert.strictEqual(shopify.isValidShopDomain('my-valid-store.myshopify.com'), true);
+    assert.strictEqual(shopify.isValidShopDomain('hk-mart-cfoepmjd.myshopify.com'), true);
+    assert.strictEqual(shopify.isValidShopDomain('store123.myshopify.com'), true);
+
+    // Attacks & invalid formats must fail
+    assert.strictEqual(shopify.isValidShopDomain('evil.com'), false);
+    assert.strictEqual(shopify.isValidShopDomain('my-store.myshopify.com.evil.com'), false);
+    assert.strictEqual(shopify.isValidShopDomain('http://my-store.myshopify.com'), false);
+    assert.strictEqual(shopify.isValidShopDomain('my-store.myshopify.com/admin'), false);
+    assert.strictEqual(shopify.isValidShopDomain(''), false);
+    assert.strictEqual(shopify.isValidShopDomain(null), false);
+  });
+
+  // Test 7: Security - Signed HMAC Session Tokens
+  test('Security: Cryptographic session token generation and verification', () => {
+    const secret = 'super_secret_app_key_555';
+    const shop = 'secure-merchant.myshopify.com';
+
+    const token = shopify.createSessionToken(shop, secret);
+    assert.strictEqual(typeof token, 'string');
+    assert(token.includes('.'));
+
+    // Valid verification
+    const verified = shopify.verifySessionToken(token, shop, secret);
+    assert.strictEqual(verified, true);
+
+    // Tampered token must fail
+    const tampered = token.slice(0, -4) + 'abcd';
+    assert.strictEqual(shopify.verifySessionToken(tampered, shop, secret), false);
+
+    // Mismatched shop must fail
+    assert.strictEqual(shopify.verifySessionToken(token, 'other-shop.myshopify.com', secret), false);
+  });
+
+  // Test 8: Security - Excel / CSV Formula Injection Sanitization (CVE defense)
+  test('Security: sanitizeCell neutralizes CSV/Excel formula injection vectors', () => {
+    assert.strictEqual(sanitizeCell('=SUM(A1:A10)'), "'=SUM(A1:A10)");
+    assert.strictEqual(sanitizeCell('+cmd|/c calc'), "'+cmd|/c calc");
+    assert.strictEqual(sanitizeCell('-1+1'), "'-1+1");
+    assert.strictEqual(sanitizeCell('@IMPORTDATA("http://evil.com")'), "'@IMPORTDATA(\"http://evil.com\")");
+    assert.strictEqual(sanitizeCell('\t=cmd'), "'\t=cmd");
+    assert.strictEqual(sanitizeCell('\r=cmd'), "'\r=cmd");
+
+    // Standard benign strings remain untouched
+    assert.strictEqual(sanitizeCell('#1001'), '#1001');
+    assert.strictEqual(sanitizeCell('Yoga Mat Pro'), 'Yoga Mat Pro');
+    assert.strictEqual(sanitizeCell(42), 42);
   });
 
   console.log('--- [Test Suite Summary] ---');

@@ -3,6 +3,15 @@ const crypto = require('crypto');
 const API_VERSION = '2024-10';
 
 /**
+ * Strict validation of Shopify store domain to prevent SSRF and injection
+ */
+function isValidShopDomain(shop) {
+  if (typeof shop !== 'string') return false;
+  const clean = shop.toLowerCase().trim();
+  return /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(clean);
+}
+
+/**
  * Verify HMAC on incoming Shopify query params using timing-safe comparison
  */
 function verifyHmac(query, apiSecret) {
@@ -48,9 +57,48 @@ function verifyWebhookHmac(rawBody, headerHmac, apiSecret) {
 }
 
 /**
+ * Create a cryptographic session signature for in-dashboard client API calls
+ */
+function createSessionToken(shop, apiSecret, ttlMs = 24 * 60 * 60 * 1000) {
+  const expiresAt = Date.now() + ttlMs;
+  const payload = `${shop}:${expiresAt}`;
+  const sig = crypto.createHmac('sha256', apiSecret).update(payload).digest('hex');
+  return `${expiresAt}.${sig}`;
+}
+
+/**
+ * Verify cryptographic session token for dashboard API actions
+ */
+function verifySessionToken(token, shop, apiSecret) {
+  if (!token || !shop || !apiSecret) return false;
+  const parts = String(token).split('.');
+  if (parts.length !== 2) return false;
+  const [expiresAtStr, sig] = parts;
+  const expiresAt = parseInt(expiresAtStr, 10);
+  if (isNaN(expiresAt) || Date.now() > expiresAt) return false;
+
+  const expectedSig = crypto
+    .createHmac('sha256', apiSecret)
+    .update(`${shop}:${expiresAtStr}`)
+    .digest('hex');
+
+  try {
+    const a = Buffer.from(sig, 'utf8');
+    const b = Buffer.from(expectedSig, 'utf8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * Exchange temporary authorization code for an offline Shopify access token
  */
 async function exchangeCodeForToken(shop, code, clientId, clientSecret) {
+  if (!isValidShopDomain(shop)) {
+    throw new Error(`Security validation failed: Invalid shop domain "${shop}"`);
+  }
+
   const url = `https://${shop}/admin/oauth/access_token`;
   const response = await fetch(url, {
     method: 'POST',
@@ -75,12 +123,16 @@ async function exchangeCodeForToken(shop, code, clientId, clientSecret) {
 }
 
 /**
- * Fetch real unfulfilled orders for the shop via Shopify GraphQL Admin API
+ * Fetch real unfulfilled orders with GraphQL cursor pagination (up to 250 orders)
  */
-async function fetchUnfulfilledOrders(shop, accessToken) {
+async function fetchUnfulfilledOrders(shop, accessToken, maxOrders = 250) {
   const query = `
-    query getUnfulfilledOrders {
-      orders(first: 50, query: "fulfillment_status:unfulfilled", sortKey: CREATED_AT, reverse: true) {
+    query getUnfulfilledOrders($cursor: String) {
+      orders(first: 50, after: $cursor, query: "fulfillment_status:unfulfilled", sortKey: CREATED_AT, reverse: true) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         edges {
           node {
             id
@@ -121,26 +173,40 @@ async function fetchUnfulfilledOrders(shop, accessToken) {
     }
   `;
 
-  const response = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': accessToken
-    },
-    body: JSON.stringify({ query })
-  });
+  let cursor = null;
+  let hasNext = true;
+  const rawOrders = [];
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Shopify GraphQL error (${response.status}): ${errText}`);
+  while (hasNext && rawOrders.length < maxOrders) {
+    const response = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': accessToken
+      },
+      body: JSON.stringify({ query, variables: { cursor } })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Shopify GraphQL error (${response.status}): ${errText}`);
+    }
+
+    const result = await response.json();
+    if (result.errors) {
+      throw new Error(`GraphQL query error: ${JSON.stringify(result.errors)}`);
+    }
+
+    const connection = result.data?.orders;
+    const edges = connection?.edges || [];
+    rawOrders.push(...edges);
+
+    hasNext = Boolean(connection?.pageInfo?.hasNextPage);
+    cursor = connection?.pageInfo?.endCursor || null;
+
+    if (!cursor || edges.length === 0) break;
   }
 
-  const result = await response.json();
-  if (result.errors) {
-    throw new Error(`GraphQL query error: ${JSON.stringify(result.errors)}`);
-  }
-
-  const rawOrders = result.data?.orders?.edges || [];
   const normalizedRows = [];
 
   rawOrders.forEach(edge => {
@@ -200,8 +266,16 @@ async function fetchUnfulfilledOrders(shop, accessToken) {
  * Create a recurring Shopify App Subscription (Monthly $9.99 or Annual $99.99) via GraphQL
  * Includes 7-day free trial
  */
-async function createAppSubscription(shop, accessToken, returnUrl, isTest = true, planType = 'monthly') {
+async function createAppSubscription(shop, accessToken, returnUrl, isTest = null, planType = 'monthly') {
+  if (!isValidShopDomain(shop)) {
+    throw new Error(`Security validation failed: Invalid shop domain "${shop}"`);
+  }
+
   const isAnnual = planType === 'annual';
+  const testFlag = isTest !== null 
+    ? Boolean(isTest) 
+    : (process.env.SHOPIFY_BILLING_TEST === 'true' || process.env.NODE_ENV !== 'production');
+
   const mutation = `
     mutation AppSubscriptionCreate($name: String!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean!, $price: Decimal!, $interval: AppPricingInterval!) {
       appSubscriptionCreate(
@@ -237,7 +311,7 @@ async function createAppSubscription(shop, accessToken, returnUrl, isTest = true
     name: isAnnual ? 'OrderDrop Annual Plan (2 Months Free)' : 'OrderDrop Monthly Plan',
     returnUrl: returnUrl,
     trialDays: 7,
-    test: isTest,
+    test: testFlag,
     price: isAnnual ? '99.99' : '9.99',
     interval: isAnnual ? 'ANNUAL' : 'EVERY_30_DAYS'
   };
@@ -307,8 +381,11 @@ async function checkActiveSubscription(shop, accessToken) {
 }
 
 module.exports = {
+  isValidShopDomain,
   verifyHmac,
   verifyWebhookHmac,
+  createSessionToken,
+  verifySessionToken,
   exchangeCodeForToken,
   fetchUnfulfilledOrders,
   createAppSubscription,

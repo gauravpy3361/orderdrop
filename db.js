@@ -13,37 +13,7 @@ if (!fs.existsSync(DATA_DIR)) {
 // In-memory cache synced with disk and PostgreSQL
 let shops = {};
 let pgPool = null;
-
-if (process.env.DATABASE_URL) {
-  try {
-    pgPool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
-    });
-
-    // Initialize DB table and load existing shops from Postgres into memory
-    (async () => {
-      try {
-        await pgPool.query(`
-          CREATE TABLE IF NOT EXISTS shops (
-            shop VARCHAR(255) PRIMARY KEY,
-            data JSONB NOT NULL,
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-          );
-        `);
-        const res = await pgPool.query('SELECT shop, data FROM shops;');
-        for (const row of res.rows) {
-          shops[row.shop.toLowerCase().trim()] = row.data;
-        }
-        console.log(`[DB] Loaded ${res.rows.length} store(s) from persistent PostgreSQL.`);
-      } catch (err) {
-        console.error('[DB] PostgreSQL init/sync error:', err.message);
-      }
-    })();
-  } catch (poolErr) {
-    console.error('[DB] Failed to initialize PostgreSQL pool:', poolErr.message);
-  }
-}
+let initPromise = null;
 
 function loadLocal() {
   try {
@@ -86,10 +56,54 @@ async function deletePg(shopDomain) {
   }
 }
 
-// Initial local load
+// Initial local load from disk
 loadLocal();
 
+async function init() {
+  if (!process.env.DATABASE_URL) {
+    return shops;
+  }
+
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    try {
+      if (!pgPool) {
+        pgPool = new Pool({
+          connectionString: process.env.DATABASE_URL,
+          ssl: { rejectUnauthorized: false }
+        });
+      }
+
+      await pgPool.query(`
+        CREATE TABLE IF NOT EXISTS shops (
+          shop VARCHAR(255) PRIMARY KEY,
+          data JSONB NOT NULL,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      const res = await pgPool.query('SELECT shop, data FROM shops;');
+      for (const row of res.rows) {
+        shops[row.shop.toLowerCase().trim()] = row.data;
+      }
+      console.log(`[DB] Loaded ${res.rows.length} store(s) from persistent PostgreSQL.`);
+      return shops;
+    } catch (err) {
+      console.error('[DB] PostgreSQL init/sync error:', err.message);
+      return shops;
+    }
+  })();
+
+  return initPromise;
+}
+
+// Eagerly trigger init in background
+init().catch(() => {});
+
 module.exports = {
+  init,
+
   getShop(domain) {
     if (!domain) return null;
     const cleanDomain = domain.toLowerCase().trim();
@@ -100,21 +114,30 @@ module.exports = {
     if (!domain) return null;
     const cleanDomain = domain.toLowerCase().trim();
     const existing = shops[cleanDomain] || {};
+    const defaultDevShop = (process.env.SHOP_DOMAIN || 'hk-mart-cfoepmjd.myshopify.com').toLowerCase().trim();
+    const isDevStore = cleanDomain === defaultDevShop;
+
     shops[cleanDomain] = {
       shop: cleanDomain,
       installedAt: existing.installedAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      scheduleTime: '18:00',
-      recipientEmail: process.env.MERCHANT_EMAIL || 'www.sunitajoshi98765@gmail.com',
-      autoDispatchEnabled: true,
-      plan: 'Starter ($9.99/mo)',
-      subscriptionStatus: 'active',
-      subscriptionId: null,
+      scheduleTime: existing.scheduleTime || '18:00',
+      recipientEmail: existing.recipientEmail !== undefined 
+        ? existing.recipientEmail 
+        : (isDevStore ? (process.env.MERCHANT_EMAIL || '') : ''),
+      autoDispatchEnabled: existing.autoDispatchEnabled !== undefined 
+        ? existing.autoDispatchEnabled 
+        : (isDevStore && Boolean(process.env.MERCHANT_EMAIL)),
+      plan: existing.plan || 'Free Trial (7 Days)',
+      subscriptionStatus: existing.subscriptionStatus || 'trial',
+      trialEndsAt: existing.trialEndsAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      subscriptionId: existing.subscriptionId || null,
       ...existing,
       ...data
     };
+
     persistLocal();
-    persistPg(cleanDomain, shops[cleanDomain]);
+    persistPg(cleanDomain, shops[cleanDomain]).catch(() => {});
     return shops[cleanDomain];
   },
 
@@ -124,7 +147,7 @@ module.exports = {
     if (shops[cleanDomain]) {
       delete shops[cleanDomain];
       persistLocal();
-      deletePg(cleanDomain);
+      deletePg(cleanDomain).catch(() => {});
       return true;
     }
     return false;
@@ -135,6 +158,21 @@ module.exports = {
   },
 
   getAllActiveShops() {
-    return Object.values(shops).filter(s => s.accessToken && s.autoDispatchEnabled);
+    const now = new Date();
+    return Object.values(shops).filter(s => {
+      // Must have valid credentials, recipient, and enabled dispatch
+      if (!s.accessToken || !s.autoDispatchEnabled || !s.recipientEmail || !s.recipientEmail.trim()) {
+        return false;
+      }
+      // Must be active subscriber OR within 7-day free trial
+      if (s.subscriptionStatus === 'active') {
+        return true;
+      }
+      if (s.subscriptionStatus === 'trial' || s.plan?.includes('Trial')) {
+        if (!s.trialEndsAt) return true;
+        return new Date(s.trialEndsAt) > now;
+      }
+      return false;
+    });
   }
 };
