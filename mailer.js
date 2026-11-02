@@ -72,8 +72,8 @@ async function sendOrdersEmail({ to, shop, orderCount, excelBuffer, filename }) 
     </html>
   `;
 
-  // Production from address (or onboarding@resend.dev sandbox)
-  const fromAddress = process.env.RESEND_FROM_EMAIL || 'OrderDrop <onboarding@resend.dev>';
+  // Production from address (verified custom domain)
+  const fromAddress = process.env.RESEND_FROM_EMAIL || 'OrderDrop <orders@orderdrop.store>';
 
   const result = await resend.emails.send({
     from: fromAddress,
