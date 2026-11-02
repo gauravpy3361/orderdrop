@@ -13,6 +13,7 @@ const { generateOrdersWorkbook } = require('./export_engine');
 const scheduler = require('./scheduler');
 
 const app = express();
+app.set('trust proxy', 1);
 
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
