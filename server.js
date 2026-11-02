@@ -167,10 +167,14 @@ app.get('/auth/callback', async (req, res) => {
     const tokenData = await shopify.exchangeCodeForToken(shop, code, CLIENT_ID, CLIENT_SECRET);
     
     // 3. Persist in Multi-Tenant Database
+    const existing = db.getShop(shop);
     db.saveShop(shop, {
       accessToken: tokenData.accessToken,
       scopes: tokenData.scope,
-      installedAt: new Date().toISOString()
+      installedAt: new Date().toISOString(),
+      subscriptionStatus: existing?.subscriptionStatus || 'trial',
+      trialEndsAt: existing?.trialEndsAt || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      plan: existing?.plan || 'Free Trial (7 Days)'
     });
 
     console.log(`[OAuth] Successfully authenticated shop: ${shop}`);
@@ -185,10 +189,11 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 3. SHOPIFY RECURRING BILLING ROUTES ($9.99/mo)
+// 3. SHOPIFY RECURRING BILLING ROUTES (Monthly $9.99 / Annual $99.99)
 // -------------------------------------------------------------
 app.get('/api/billing/subscribe', async (req, res) => {
   const shop = req.query.shop || DEFAULT_SHOP;
+  const planType = req.query.plan === 'annual' ? 'annual' : 'monthly';
   const shopData = db.getShop(shop);
 
   if (!shopData || !shopData.accessToken) {
@@ -196,8 +201,8 @@ app.get('/api/billing/subscribe', async (req, res) => {
   }
 
   try {
-    const returnUrl = `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shop)}`;
-    const subscription = await shopify.createAppSubscription(shop, shopData.accessToken, returnUrl, true);
+    const returnUrl = `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shop)}&plan=${planType}`;
+    const subscription = await shopify.createAppSubscription(shop, shopData.accessToken, returnUrl, true, planType);
 
     if (subscription.confirmationUrl) {
       return res.redirect(subscription.confirmationUrl);
@@ -212,16 +217,18 @@ app.get('/api/billing/subscribe', async (req, res) => {
 app.get('/api/billing/confirm', (req, res) => {
   const shop = req.query.shop || DEFAULT_SHOP;
   const chargeId = req.query.charge_id;
+  const planType = req.query.plan === 'annual' ? 'annual' : 'monthly';
+  const planLabel = planType === 'annual' ? 'Annual Plan ($99.99/yr)' : 'Monthly Plan ($9.99/mo)';
 
   db.saveShop(shop, {
     subscriptionStatus: 'active',
-    subscriptionId: chargeId || 'sub_active'
+    subscriptionId: chargeId || 'sub_active',
+    plan: planLabel
   });
 
   res.redirect(`/?shop=${encodeURIComponent(shop)}&billing=confirmed`);
 });
 
-// -------------------------------------------------------------
 // 4. MERCHANT API ENDPOINTS (AUTHENTICATED & RATE-LIMITED)
 // -------------------------------------------------------------
 app.use('/api', apiLimiter);
@@ -409,8 +416,15 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
   const shop = escapeHtml(shopData.shop);
   const recipient = escapeHtml(shopData.recipientEmail || '');
   const scheduleTime = escapeHtml(shopData.scheduleTime || '18:00');
-  const plan = escapeHtml(shopData.plan || 'Starter ($9.99/mo)');
+  const plan = escapeHtml(shopData.plan || 'Free Trial (7 Days)');
+  const isActive = shopData.subscriptionStatus === 'active';
   const orderCount = orders.length;
+
+  let trialText = '7-Day Free Trial';
+  if (shopData.trialEndsAt) {
+    const daysLeft = Math.max(0, Math.ceil((new Date(shopData.trialEndsAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)));
+    trialText = `Trial: ${daysLeft} day${daysLeft === 1 ? '' : 's'} left`;
+  }
 
   let tableRows = '';
   if (orders.length === 0) {
@@ -466,7 +480,9 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
       <p style="margin: 4px 0 0; color: #6d7175; font-size: 13px;">Connected Store: <strong>${shop}</strong></p>
     </div>
     <div style="display: flex; gap: 8px;">
-      <span class="badge badge-plan">💎 ${plan}</span>
+      <span class="badge ${isActive ? 'badge-plan' : ''}" style="${isActive ? '' : 'background: #fef3c7; color: #92400e; border: 1px solid #fde68a;'}">
+        ${isActive ? '💎 ' + plan : '⏱️ ' + trialText}
+      </span>
       <span class="badge">● Multi-Tenant Active</span>
     </div>
   </div>
@@ -533,13 +549,43 @@ function renderDashboard(shopData, orders = [], fetchError = null) {
   </div>
 
   <div class="card" style="border-left: 4px solid #008060;">
-    <div style="display: flex; justify-content: space-between; align-items: center;">
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px;">
       <div>
-        <h3 style="font-size: 15px; margin: 0 0 4px; font-weight: 600;">Subscription & Plan</h3>
-        <p style="margin: 0; font-size: 13px; color: #6d7175;">Plan: <strong>${plan}</strong> · 7-Day Free Trial included. Billed via Shopify Recurring Billing API.</p>
+        <h3 style="font-size: 16px; margin: 0 0 4px; font-weight: 700;">Subscription & Plan</h3>
+        <p style="margin: 0; font-size: 13px; color: #6d7175;">
+          ${isActive
+            ? `Active Plan: <strong>${plan}</strong> · Charges managed seamlessly via your Shopify monthly bill.`
+            : `<strong>7-Day Free Trial Active (${trialText})</strong> · No upfront credit card required. Choose your plan to keep automations uninterrupted:`}
+        </p>
       </div>
-      <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}" class="btn btn-secondary" style="font-size: 13px;">Approve Subscription</a>
+      <span class="badge" style="${isActive ? 'background: #dcfce7; color: #166534;' : 'background: #fef3c7; color: #92400e;'}">
+        ${isActive ? '● Active Subscriber' : '⏱️ 7-Day Free Trial'}
+      </span>
     </div>
+
+    ${!isActive ? `
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px;">
+      <div style="border: 1px solid #e2e8f0; border-radius: 8px; padding: 18px; background: #ffffff;">
+        <div style="font-weight: 700; font-size: 15px; margin-bottom: 4px;">Monthly Plan</div>
+        <div style="font-size: 24px; font-weight: 800; color: #008060; margin-bottom: 6px;">$9.99 <span style="font-size: 13px; font-weight: 400; color: #64748b;">/ month</span></div>
+        <p style="font-size: 12px; color: #64748b; margin: 0 0 14px; min-height: 32px;">Includes full 7-day free trial. Billed every 30 days via Shopify. Cancel anytime with zero fees.</p>
+        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=monthly" class="btn btn-secondary" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Monthly ($9.99/mo)</a>
+      </div>
+
+      <div style="border: 2px solid #008060; border-radius: 8px; padding: 18px; background: #f0fdf4; position: relative;">
+        <span style="position: absolute; top: -11px; right: 14px; background: #008060; color: white; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 12px; letter-spacing: 0.5px;">SAVE 17% · 2 MONTHS FREE</span>
+        <div style="font-weight: 700; font-size: 15px; margin-bottom: 4px;">Annual Plan</div>
+        <div style="font-size: 24px; font-weight: 800; color: #008060; margin-bottom: 6px;">$99.99 <span style="font-size: 13px; font-weight: 400; color: #64748b;">/ year</span></div>
+        <p style="font-size: 12px; color: #166534; margin: 0 0 14px; min-height: 32px;">Includes full 7-day free trial. ~$8.33/mo. Best value for high-volume and scaling merchants.</p>
+        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=annual" class="btn" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Annual ($99.99/yr)</a>
+      </div>
+    </div>
+    ` : `
+    <div style="padding: 14px; background: #f0fdf4; border-radius: 8px; font-size: 13px; color: #166534; display: flex; align-items: center; justify-content: space-between;">
+      <span>Your store is subscribed to <strong>${plan}</strong>. All automated dispatches and Excel exports are fully active.</span>
+      <span style="font-size: 12px; color: #15803d; font-weight: 600;">Managed via Shopify Billing</span>
+    </div>
+    `}
   </div>
 
   <div id="toast" class="toast">Schedule updated successfully!</div>
@@ -631,7 +677,7 @@ function renderLandingPage() {
   <div class="header">
     <div class="logo">📦 Order<span>Drop</span></div>
     <div>
-      <span style="font-size: 14px; color: #94a3b8; margin-right: 16px;">$9.99/mo · 7-Day Free Trial</span>
+      <span style="font-size: 14px; color: #94a3b8; margin-right: 16px;">$9.99/mo or $99.99/yr · 7-Day Free Trial</span>
       <a href="#install" class="btn-cta" style="padding: 8px 18px; font-size: 13px;">Install App</a>
     </div>
   </div>
@@ -645,7 +691,7 @@ function renderLandingPage() {
       <input type="text" id="storeInput" placeholder="your-store-name.myshopify.com" value="hk-mart-cfoepmjd.myshopify.com" />
       <button class="btn-cta" onclick="installNow()">Install Free</button>
     </div>
-    <p style="font-size: 13px; color: #64748b; margin: 0;">7-day free trial · 1-click install via Shopify · Cancel anytime</p>
+    <p style="font-size: 13px; color: #64748b; margin: 0;">7-day free trial on all plans · No credit card required to install · Cancel anytime with zero lock-in</p>
   </div>
 
   <div class="footer-links">

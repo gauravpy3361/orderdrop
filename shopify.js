@@ -197,11 +197,13 @@ async function fetchUnfulfilledOrders(shop, accessToken) {
 }
 
 /**
- * Create a recurring Shopify App Subscription ($9.99/mo) via GraphQL
+ * Create a recurring Shopify App Subscription (Monthly $9.99 or Annual $99.99) via GraphQL
+ * Includes 7-day free trial
  */
-async function createAppSubscription(shop, accessToken, returnUrl, isTest = true) {
+async function createAppSubscription(shop, accessToken, returnUrl, isTest = true, planType = 'monthly') {
+  const isAnnual = planType === 'annual';
   const mutation = `
-    mutation AppSubscriptionCreate($name: String!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean!, $price: Decimal!) {
+    mutation AppSubscriptionCreate($name: String!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean!, $price: Decimal!, $interval: AppPricingInterval!) {
       appSubscriptionCreate(
         name: $name,
         returnUrl: $returnUrl,
@@ -212,7 +214,7 @@ async function createAppSubscription(shop, accessToken, returnUrl, isTest = true
             plan: {
               appRecurringPricingDetails: {
                 price: { amount: $price, currencyCode: USD },
-                interval: EVERY_30_DAYS
+                interval: $interval
               }
             }
           }
@@ -232,11 +234,12 @@ async function createAppSubscription(shop, accessToken, returnUrl, isTest = true
   `;
 
   const variables = {
-    name: 'OrderDrop Starter Plan',
+    name: isAnnual ? 'OrderDrop Annual Plan (2 Months Free)' : 'OrderDrop Monthly Plan',
     returnUrl: returnUrl,
     trialDays: 7,
     test: isTest,
-    price: '9.99'
+    price: isAnnual ? '99.99' : '9.99',
+    interval: isAnnual ? 'ANNUAL' : 'EVERY_30_DAYS'
   };
 
   const response = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
