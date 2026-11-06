@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const https = require('https');
 const http = require('http');
-const path = require('path');
 const crypto = require('crypto');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -16,11 +15,24 @@ const scheduler = require('./scheduler');
 const app = express();
 app.set('trust proxy', 1);
 
-const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-const APP_URL = process.env.APP_URL || 'https://orderdrop.onrender.com';
-const CRON_SECRET = process.env.CRON_SECRET || 'orderdrop_cron_secret_secure_key';
-const SESSION_SECRET = CLIENT_SECRET || 'orderdrop_production_session_secure_key';
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY;
+const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET;
+const APP_URL = (process.env.APP_URL || 'https://orderdrop.store').replace(/\/+$/, '');
+const APP_HANDLE = process.env.SHOPIFY_APP_HANDLE || 'orderdrop-1';
+const SHOPIFY_SCOPES = process.env.SHOPIFY_SCOPES || 'read_orders';
+
+// Derive strong deterministic secrets from CLIENT_SECRET when explicit env secrets are not set
+const SESSION_SECRET = process.env.SESSION_SECRET || (
+  CLIENT_SECRET
+    ? crypto.createHmac('sha256', CLIENT_SECRET).update('orderdrop_session_v1').digest('hex')
+    : 'dev_only_local_session_secret'
+);
+const CRON_SECRET = process.env.CRON_SECRET || (
+  CLIENT_SECRET
+    ? crypto.createHmac('sha256', CLIENT_SECRET).update('orderdrop_cron_v1').digest('hex')
+    : ''
+);
+const DEFAULT_SHOP = (process.env.SHOP_DOMAIN || 'hk-mart-cfoepmjd.myshopify.com').toLowerCase().trim();
 
 // Disable X-Powered-By
 app.disable('x-powered-by');
@@ -35,7 +47,7 @@ app.use(
         scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.shopify.com", "https://unpkg.com"],
         styleSrc: ["'self'", "'unsafe-inline'", "https://unpkg.com"],
         imgSrc: ["'self'", "data:", "https:"],
-        connectSrc: ["'self'"]
+        connectSrc: ["'self'", "https://*.shopify.com", "https://*.myshopify.com"]
       }
     },
     crossOriginEmbedderPolicy: false
@@ -78,34 +90,37 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
+/**
+ * Helper to verify whether a request carries valid merchant authentication for `shop`
+ */
+function isRequestAuthenticatedForShop(req, shop) {
+  if (!shop || !shopify.isValidShopDomain(shop)) return false;
+  const cleanShop = shop.toLowerCase().trim();
+
+  const token = req.headers['x-orderdrop-token'] || req.query.token;
+  const authHeader = req.headers['authorization'];
+  const idToken = req.query.id_token || (authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null);
+
+  const hasValidToken = Boolean(token && shopify.verifySessionToken(token, cleanShop, SESSION_SECRET));
+  const hasValidHmac = Boolean(CLIENT_SECRET && req.query.hmac && shopify.verifyHmac(req.query, CLIENT_SECRET));
+  const hasValidJwt = Boolean(CLIENT_SECRET && idToken && shopify.verifyAppBridgeJwt(idToken, CLIENT_ID, CLIENT_SECRET, cleanShop));
+
+  return hasValidToken || hasValidHmac || hasValidJwt;
+}
+
 // Authentication Middleware for API endpoints (prevents tenant IDOR & token leaks)
 function verifyShopAuth(req, res, next) {
-  const shop = req.body.shop || req.query.shop;
-  const token = req.headers['x-orderdrop-token'] || req.query.token;
+  const shop = req.body?.shop || req.query?.shop;
 
   if (!shop || !shopify.isValidShopDomain(shop)) {
     return res.status(400).json({ success: false, error: 'Invalid or missing shop domain format.' });
   }
 
-  const hasValidToken = shopify.verifySessionToken(token, shop, SESSION_SECRET);
-  const hasValidHmac = req.query.hmac && shopify.verifyHmac(req.query, SESSION_SECRET);
-
-  if (!hasValidToken && !hasValidHmac) {
+  if (!isRequestAuthenticatedForShop(req, shop)) {
     return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or expired session credentials.' });
   }
 
   next();
-}
-
-// Ensure default test store is registered in db if present
-const DEFAULT_SHOP = process.env.SHOP_DOMAIN || 'hk-mart-cfoepmjd.myshopify.com';
-if (!db.getShop(DEFAULT_SHOP)) {
-  db.saveShop(DEFAULT_SHOP, {
-    shop: DEFAULT_SHOP,
-    recipientEmail: process.env.MERCHANT_EMAIL || '',
-    plan: 'Starter ($9.99/mo)',
-    subscriptionStatus: 'active'
-  });
 }
 
 // -------------------------------------------------------------
@@ -113,21 +128,17 @@ if (!db.getShop(DEFAULT_SHOP)) {
 // -------------------------------------------------------------
 app.get('/', async (req, res) => {
   const shopQuery = req.query.shop;
-  const isEmbedded = req.query.embedded === '1' || req.query.host || Boolean(shopQuery);
 
-  if (isEmbedded && shopQuery) {
+  if (shopQuery !== undefined) {
     if (!shopify.isValidShopDomain(shopQuery)) {
       return res.status(400).send('<h3>Invalid store domain. Please provide a valid .myshopify.com address.</h3>');
     }
 
     const cleanShop = shopQuery.toLowerCase().trim();
 
-    // Verify HMAC when coming from Shopify embedded admin
-    if (CLIENT_SECRET && (req.query.hmac || req.query.embedded)) {
-      const isValidHmac = shopify.verifyHmac(req.query, CLIENT_SECRET);
-      if (!isValidHmac) {
-        return res.status(401).send('<h3>Unauthorized: Invalid Shopify HMAC signature</h3>');
-      }
+    // Strictly require valid Shopify HMAC, App Bridge JWT, or signed Session Token
+    if (!isRequestAuthenticatedForShop(req, cleanShop)) {
+      return res.status(401).send(renderUnauthorizedPage(cleanShop));
     }
 
     let shopData = db.getShop(cleanShop);
@@ -164,47 +175,56 @@ app.get('/auth', (req, res) => {
     return res.status(400).send('Missing "shop" parameter. Please provide your myshopify.com address.');
   }
 
-  const cleanShop = shop.replace(/^https?:\/\//, '').replace(/\/.*$/, '').toLowerCase().trim();
+  const cleanShop = String(shop).replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase().trim();
   if (!shopify.isValidShopDomain(cleanShop)) {
     return res.status(400).send('Security error: Invalid shop domain format.');
   }
 
-  const stateNonce = crypto.randomBytes(16).toString('hex');
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    return res.status(500).send('Server configuration error: Missing Shopify API credentials.');
+  }
+
+  const stateNonce = shopify.createOAuthState(cleanShop, SESSION_SECRET);
   const redirectUri = `${APP_URL}/auth/callback`;
-  const scopes = 'read_orders,write_orders';
-  const installUrl = `https://${cleanShop}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${stateNonce}`;
+  const installUrl = `https://${cleanShop}/admin/oauth/authorize?client_id=${encodeURIComponent(CLIENT_ID)}&scope=${encodeURIComponent(SHOPIFY_SCOPES)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(stateNonce)}`;
 
   res.redirect(installUrl);
 });
 
 app.get('/auth/callback', async (req, res) => {
-  const { shop, hmac, code } = req.query;
+  const { shop, hmac, code, state } = req.query;
 
   if (!shop || !code) {
     return res.status(400).send('Invalid OAuth callback: missing shop or code.');
   }
 
-  if (!shopify.isValidShopDomain(shop)) {
+  const cleanShop = String(shop).toLowerCase().trim();
+  if (!shopify.isValidShopDomain(cleanShop)) {
     return res.status(400).send('Security check failed: Invalid shop domain format.');
   }
 
-  // 1. Strictly verify HMAC Signature
-  if (!hmac || !CLIENT_SECRET) {
-    return res.status(400).send('Security check failed: Missing security credentials.');
+  // 1. Strictly verify HMAC Signature & OAuth CSRF state
+  if (!hmac || !state || !CLIENT_SECRET) {
+    return res.status(400).send('Security check failed: Missing security credentials or state parameter.');
   }
 
-  const isValid = shopify.verifyHmac(req.query, CLIENT_SECRET);
-  if (!isValid) {
+  const isValidHmac = shopify.verifyHmac(req.query, CLIENT_SECRET);
+  if (!isValidHmac) {
     return res.status(400).send('Security check failed: HMAC verification failed.');
+  }
+
+  const isValidState = shopify.verifyOAuthState(state, cleanShop, SESSION_SECRET);
+  if (!isValidState) {
+    return res.status(400).send('Security check failed: Invalid or expired OAuth state nonce.');
   }
 
   try {
     // 2. Exchange authorization code for offline access token
-    const tokenData = await shopify.exchangeCodeForToken(shop, code, CLIENT_ID, CLIENT_SECRET);
-    
+    const tokenData = await shopify.exchangeCodeForToken(cleanShop, code, CLIENT_ID, CLIENT_SECRET);
+
     // 3. Persist in Multi-Tenant Database
-    const existing = db.getShop(shop);
-    db.saveShop(shop, {
+    const existing = db.getShop(cleanShop);
+    db.saveShop(cleanShop, {
       accessToken: tokenData.accessToken,
       scopes: tokenData.scope,
       installedAt: new Date().toISOString(),
@@ -213,10 +233,10 @@ app.get('/auth/callback', async (req, res) => {
       plan: existing?.plan || 'Free Trial (7 Days)'
     });
 
-    console.log(`[OAuth] Successfully authenticated shop: ${shop}`);
+    console.log(`[OAuth] Successfully authenticated shop: ${cleanShop}`);
 
     // 4. Redirect into Shopify Admin Embedded App
-    res.redirect(`https://admin.shopify.com/store/${shop.replace('.myshopify.com', '')}/apps/orderdrop-1`);
+    res.redirect(`https://admin.shopify.com/store/${cleanShop.replace('.myshopify.com', '')}/apps/${APP_HANDLE}`);
   } catch (err) {
     console.error('[OAuth] Token exchange error:', err.message);
     res.status(500).send(`Authentication failed: ${escapeHtml(err.message)}`);
@@ -227,23 +247,33 @@ app.get('/auth/callback', async (req, res) => {
 // 3. SHOPIFY RECURRING BILLING ROUTES (Monthly $9.99 / Annual $99.99)
 // -------------------------------------------------------------
 app.get('/api/billing/subscribe', async (req, res) => {
-  const shop = req.query.shop || DEFAULT_SHOP;
+  const shop = req.query.shop;
+  if (!shop || !shopify.isValidShopDomain(shop)) {
+    return res.status(400).json({ error: 'Invalid or missing shop domain format.' });
+  }
+
+  const cleanShop = shop.toLowerCase().trim();
+  if (!isRequestAuthenticatedForShop(req, cleanShop)) {
+    return res.status(401).json({ error: 'Unauthorized: Valid session credentials required to initiate billing.' });
+  }
+
   const planType = req.query.plan === 'annual' ? 'annual' : 'monthly';
-  const shopData = db.getShop(shop);
+  const shopData = db.getShop(cleanShop);
 
   if (!shopData || !shopData.accessToken) {
-    return res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+    return res.redirect(`/auth?shop=${encodeURIComponent(cleanShop)}`);
   }
 
   try {
-    const returnUrl = `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(shop)}&plan=${planType}`;
+    const confirmToken = shopify.createSessionToken(cleanShop, SESSION_SECRET, 30 * 60 * 1000);
+    const returnUrl = `${APP_URL}/api/billing/confirm?shop=${encodeURIComponent(cleanShop)}&plan=${planType}&token=${encodeURIComponent(confirmToken)}`;
     const isTestFlag = process.env.SHOPIFY_BILLING_TEST === 'true' || process.env.NODE_ENV !== 'production';
-    const subscription = await shopify.createAppSubscription(shop, shopData.accessToken, returnUrl, isTestFlag, planType);
+    const subscription = await shopify.createAppSubscription(cleanShop, shopData.accessToken, returnUrl, isTestFlag, planType);
 
     if (subscription.confirmationUrl) {
       return res.redirect(subscription.confirmationUrl);
     }
-    res.redirect(`/?shop=${encodeURIComponent(shop)}&billing=success`);
+    return res.status(502).send('Billing error: Shopify did not return a subscription confirmation URL.');
   } catch (err) {
     console.error('[Billing] Subscription create error:', err.message);
     res.status(500).send(`Billing initiation failed: ${escapeHtml(err.message)}`);
@@ -251,28 +281,45 @@ app.get('/api/billing/subscribe', async (req, res) => {
 });
 
 app.get('/api/billing/confirm', async (req, res) => {
-  const shop = req.query.shop || DEFAULT_SHOP;
+  const shop = req.query.shop;
+  if (!shop || !shopify.isValidShopDomain(shop)) {
+    return res.status(400).json({ error: 'Invalid or missing shop domain format.' });
+  }
+
+  const cleanShop = shop.toLowerCase().trim();
+  if (!isRequestAuthenticatedForShop(req, cleanShop)) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid billing confirmation signature.' });
+  }
+
   const chargeId = req.query.charge_id;
   const planType = req.query.plan === 'annual' ? 'annual' : 'monthly';
   const planLabel = planType === 'annual' ? 'Annual Plan ($99.99/yr)' : 'Monthly Plan ($9.99/mo)';
-  const shopData = db.getShop(shop);
+  const shopData = db.getShop(cleanShop);
 
-  if (shopData?.accessToken) {
-    try {
-      const activeCheck = await shopify.checkActiveSubscription(shop, shopData.accessToken);
-      console.log(`[Billing] Confirmed subscriptions for ${shop}:`, activeCheck.subscriptions);
-    } catch (err) {
-      console.warn('[Billing] GraphQL verification note:', err.message);
-    }
+  if (!shopData || !shopData.accessToken) {
+    return res.status(401).json({ error: 'Store is not connected via OAuth.' });
   }
 
-  db.saveShop(shop, {
-    subscriptionStatus: 'active',
-    subscriptionId: chargeId || 'sub_active',
-    plan: planLabel
-  });
+  try {
+    const activeCheck = await shopify.checkActiveSubscription(cleanShop, shopData.accessToken);
+    if (!activeCheck.hasActiveSubscription) {
+      const token = shopify.createSessionToken(cleanShop, SESSION_SECRET);
+      return res.redirect(`/?shop=${encodeURIComponent(cleanShop)}&token=${encodeURIComponent(token)}&billing=declined`);
+    }
 
-  res.redirect(`/?shop=${encodeURIComponent(shop)}&billing=confirmed`);
+    const verifiedSub = activeCheck.subscriptions[0];
+    db.saveShop(cleanShop, {
+      subscriptionStatus: 'active',
+      subscriptionId: verifiedSub?.id || chargeId || 'sub_active',
+      plan: verifiedSub?.name || planLabel
+    });
+
+    const token = shopify.createSessionToken(cleanShop, SESSION_SECRET);
+    return res.redirect(`/?shop=${encodeURIComponent(cleanShop)}&token=${encodeURIComponent(token)}&billing=confirmed`);
+  } catch (err) {
+    console.error('[Billing] Verification error:', err.message);
+    return res.status(500).send(`Failed to verify subscription status with Shopify: ${escapeHtml(err.message)}`);
+  }
 });
 
 // -------------------------------------------------------------
@@ -280,23 +327,10 @@ app.get('/api/billing/confirm', async (req, res) => {
 // -------------------------------------------------------------
 app.use('/api', apiLimiter);
 
-// Direct Excel Download Endpoint (Secured by Session Token or HMAC)
-app.get('/api/export', async (req, res) => {
-  const shop = req.query.shop || DEFAULT_SHOP;
-  const token = req.query.token;
-
-  if (!shopify.isValidShopDomain(shop)) {
-    return res.status(400).json({ error: 'Invalid store domain format' });
-  }
-
-  const isValidToken = shopify.verifySessionToken(token, shop, SESSION_SECRET);
-  const isValidHmac = req.query.hmac && shopify.verifyHmac(req.query, SESSION_SECRET);
-
-  if (!isValidToken && !isValidHmac) {
-    return res.status(401).json({ error: 'Unauthorized: Invalid or expired download credentials' });
-  }
-
-  const shopData = db.getShop(shop);
+// Direct Excel Download Endpoint (Secured by Session Token, HMAC, or App Bridge JWT)
+app.get('/api/export', verifyShopAuth, async (req, res) => {
+  const cleanShop = req.query.shop.toLowerCase().trim();
+  const shopData = db.getShop(cleanShop);
   if (!shopData) {
     return res.status(404).json({ error: 'Store not found' });
   }
@@ -304,11 +338,7 @@ app.get('/api/export', async (req, res) => {
   try {
     let orders = [];
     if (shopData.accessToken) {
-      try {
-        orders = await shopify.fetchUnfulfilledOrders(shopData.shop, shopData.accessToken);
-      } catch (e) {
-        orders = [];
-      }
+      orders = await shopify.fetchUnfulfilledOrders(shopData.shop, shopData.accessToken);
     }
 
     const { buffer, filename } = await generateOrdersWorkbook(orders, shopData.shop);
@@ -322,10 +352,10 @@ app.get('/api/export', async (req, res) => {
 
 // Send Dispatch Email Now Endpoint (Strictly Rate-Limited & Authenticated)
 app.post('/api/send-email', emailLimiter, verifyShopAuth, async (req, res) => {
-  const shop = req.body.shop || DEFAULT_SHOP;
+  const cleanShop = (req.body.shop || req.query.shop).toLowerCase().trim();
   const emailOverride = req.body.email;
 
-  const shopData = db.getShop(shop);
+  const shopData = db.getShop(cleanShop);
   if (!shopData) {
     return res.status(404).json({ success: false, error: 'Store not found' });
   }
@@ -340,28 +370,38 @@ app.post('/api/send-email', emailLimiter, verifyShopAuth, async (req, res) => {
 
 // Update Store Schedule Settings Endpoint (Authenticated & Token-Sanitized)
 app.post('/api/settings', verifyShopAuth, (req, res) => {
-  const shop = req.body.shop || DEFAULT_SHOP;
-  const shopData = db.getShop(shop);
+  const cleanShop = (req.body.shop || req.query.shop).toLowerCase().trim();
+  const shopData = db.getShop(cleanShop);
 
   if (!shopData) {
     return res.status(404).json({ success: false, error: 'Store not found' });
   }
 
   const updates = {};
-  if (req.body.scheduleTime) updates.scheduleTime = req.body.scheduleTime;
-  if (req.body.recipientEmail !== undefined) updates.recipientEmail = req.body.recipientEmail.trim();
-  if (typeof req.body.autoDispatchEnabled === 'boolean') updates.autoDispatchEnabled = req.body.autoDispatchEnabled;
+  if (typeof req.body.scheduleTime === 'string' && /^\d{2}:00$/.test(req.body.scheduleTime)) {
+    updates.scheduleTime = req.body.scheduleTime;
+  }
+  if (typeof req.body.recipientEmail === 'string') {
+    const trimmedEmail = req.body.recipientEmail.trim();
+    if (trimmedEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      return res.status(400).json({ success: false, error: 'Please provide a valid recipient email address.' });
+    }
+    updates.recipientEmail = trimmedEmail;
+  }
+  if (typeof req.body.autoDispatchEnabled === 'boolean') {
+    updates.autoDispatchEnabled = req.body.autoDispatchEnabled;
+  }
 
-  const updated = db.saveShop(shop, updates);
+  const updated = db.saveShop(cleanShop, updates);
   // Strip private tokens before returning to client
   const { accessToken, scopes, ...safeConfig } = updated;
   res.json({ success: true, config: safeConfig });
 });
 
-// External Cron Trigger Endpoint (Protected by CRON_SECRET)
+// External Cron Trigger Endpoint (Protected by Timing-Safe CRON_SECRET)
 app.post('/api/cron/trigger', async (req, res) => {
-  const authHeader = req.headers['x-cron-secret'] || req.query.secret;
-  if (authHeader !== CRON_SECRET) {
+  const authHeader = String(req.headers['x-cron-secret'] || req.query.secret || '');
+  if (!CRON_SECRET || !shopify.timingSafeCompare(authHeader, CRON_SECRET)) {
     return res.status(401).json({ error: 'Unauthorized: Invalid cron secret' });
   }
 
@@ -382,7 +422,7 @@ function verifyShopifyWebhook(req, res, next) {
     return res.status(401).send('Missing webhook HMAC header');
   }
 
-  const rawBody = req.body.toString('utf8');
+  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : String(req.body || '');
   const isValid = shopify.verifyWebhookHmac(rawBody, hmacHeader, CLIENT_SECRET);
   if (!isValid) {
     return res.status(401).send('Invalid webhook HMAC signature');
@@ -415,7 +455,7 @@ app.post('/webhooks/shop/redact', verifyShopifyWebhook, (req, res) => {
 app.post('/webhooks/app/uninstalled', verifyShopifyWebhook, (req, res) => {
   try {
     const payload = JSON.parse(req.body.toString('utf8'));
-    const domain = payload.myshopify_domain;
+    const domain = payload.myshopify_domain || payload.shop_domain;
     if (domain) {
       db.saveShop(domain, { accessToken: null, autoDispatchEnabled: false });
       console.log(`[Webhook] app/uninstalled: Deactivated shop ${domain}`);
@@ -471,14 +511,41 @@ app.get('/support', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 7. HTML TEMPLATES (POLARIS-ALIGNED & ESCAPE-SANITIZED)
+// 7. HTML TEMPLATES (POLARIS-ALIGNED, APP BRIDGE & XSS-SAFE)
 // -------------------------------------------------------------
+function renderUnauthorizedPage(shopDomain) {
+  const safeShop = escapeHtml(shopDomain);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Authentication Required - OrderDrop</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+    .box { max-width: 480px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 32px; text-align: center; }
+    .btn { display: inline-block; background: #10b981; color: #0f172a; font-weight: 700; padding: 12px 24px; border-radius: 8px; text-decoration: none; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2 style="margin-top: 0;">🔒 Shopify Session Required</h2>
+    <p style="color: #94a3b8; font-size: 14px; line-height: 1.6;">
+      Unauthorized direct access to <strong>${safeShop}</strong> was blocked. Please open OrderDrop from inside your Shopify Admin or authenticate via Shopify OAuth.
+    </p>
+    <a class="btn" href="/auth?shop=${encodeURIComponent(shopDomain)}">Authenticate with Shopify</a>
+  </div>
+</body>
+</html>`;
+}
+
 function renderDashboard(shopData, orders = [], fetchError = null, sessionToken = '') {
   const shop = escapeHtml(shopData.shop);
   const recipient = escapeHtml(shopData.recipientEmail || '');
   const scheduleTime = escapeHtml(shopData.scheduleTime || '18:00');
   const plan = escapeHtml(shopData.plan || 'Free Trial (7 Days)');
   const isActive = shopData.subscriptionStatus === 'active';
+  const hasOAuthToken = Boolean(shopData.accessToken);
   const orderCount = orders.length;
 
   let trialText = '7-Day Free Trial';
@@ -497,7 +564,15 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
   }
 
   let tableRows = '';
-  if (orders.length === 0) {
+  if (!hasOAuthToken) {
+    tableRows = `
+      <tr>
+        <td colspan="7" style="text-align: center; color: #b45309; background: #fffbeb; padding: 24px;">
+          Store has not completed Shopify OAuth yet. Click <strong>Connect Shopify API</strong> above to authorize live order syncing.
+        </td>
+      </tr>
+    `;
+  } else if (orders.length === 0) {
     tableRows = `
       <tr>
         <td colspan="7" style="text-align: center; color: #64748b; padding: 24px;">
@@ -529,6 +604,8 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="shopify-api-key" content="${escapeHtml(CLIENT_ID || '')}" />
+  <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
   <title>OrderDrop - Automated Export</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f6f6f7; margin: 0; padding: 24px; color: #202223; }
@@ -549,6 +626,16 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
 </head>
 <body>
 
+  ${!hasOAuthToken ? `
+  <div class="card" style="background: #fffbeb; border: 1px solid #f59e0b; display: flex; justify-content: space-between; align-items: center;">
+    <div>
+      <strong style="color: #92400e; font-size: 14px;">⚠️ Shopify API Authorization Needed</strong>
+      <p style="margin: 4px 0 0; color: #b45309; font-size: 13px;">Complete the 1-click Shopify OAuth handshake so OrderDrop can read your unfulfilled orders.</p>
+    </div>
+    <a href="/auth?shop=${encodeURIComponent(shopData.shop)}" target="_top" class="btn" style="background: #d97706;">Connect Shopify API</a>
+  </div>
+  ` : ''}
+
   <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
     <div>
       <h1 style="font-size: 22px; margin: 0; font-weight: 700;">OrderDrop · Daily Export</h1>
@@ -558,7 +645,7 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
       <span class="badge ${isActive ? 'badge-plan' : ''}" style="${isActive ? '' : 'background: #fef3c7; color: #92400e; border: 1px solid #fde68a;'}">
         ${isActive ? '💎 ' + plan : '⏱️ ' + trialText}
       </span>
-      <span class="badge">● Multi-Tenant Active</span>
+      <span class="badge">${hasOAuthToken ? '● API Connected' : '○ Pending OAuth'}</span>
     </div>
   </div>
 
@@ -568,7 +655,7 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
         <h2 style="font-size: 16px; margin: 0 0 4px; font-weight: 600;">Today's Unfulfilled Orders (${orderCount})</h2>
         <p style="margin: 0; color: #6d7175; font-size: 13px;">Live order stream queried directly from your Shopify store.</p>
       </div>
-      <a href="/api/export?shop=${encodeURIComponent(shop)}&token=${encodeURIComponent(sessionToken)}" class="btn">
+      <a href="/api/export?shop=${encodeURIComponent(shopData.shop)}&token=${encodeURIComponent(sessionToken)}" class="btn">
         <svg width="16" height="16" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
         Download Excel (.xlsx)
       </a>
@@ -647,7 +734,7 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
         <div style="font-weight: 700; font-size: 15px; margin-bottom: 4px;">Monthly Plan</div>
         <div style="font-size: 24px; font-weight: 800; color: #008060; margin-bottom: 6px;">$9.99 <span style="font-size: 13px; font-weight: 400; color: #64748b;">/ month</span></div>
         <p style="font-size: 12px; color: #64748b; margin: 0 0 14px; min-height: 32px;">Includes full 7-day free trial. Billed every 30 days via Shopify. Cancel anytime with zero fees.</p>
-        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=monthly" target="_top" class="btn btn-secondary" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Monthly ($9.99/mo)</a>
+        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shopData.shop)}&plan=monthly&token=${encodeURIComponent(sessionToken)}" target="_top" class="btn btn-secondary" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Monthly ($9.99/mo)</a>
       </div>
 
       <div style="border: 2px solid #008060; border-radius: 8px; padding: 18px; background: #f0fdf4; position: relative;">
@@ -655,7 +742,7 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
         <div style="font-weight: 700; font-size: 15px; margin-bottom: 4px;">Annual Plan</div>
         <div style="font-size: 24px; font-weight: 800; color: #008060; margin-bottom: 6px;">$99.99 <span style="font-size: 13px; font-weight: 400; color: #64748b;">/ year</span></div>
         <p style="font-size: 12px; color: #166534; margin: 0 0 14px; min-height: 32px;">Includes full 7-day free trial. ~$8.33/mo. Best value for high-volume and scaling merchants.</p>
-        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shop)}&plan=annual" target="_top" class="btn" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Annual ($99.99/yr)</a>
+        <a href="/api/billing/subscribe?shop=${encodeURIComponent(shopData.shop)}&plan=annual&token=${encodeURIComponent(sessionToken)}" target="_top" class="btn" style="width: 100%; justify-content: center; box-sizing: border-box;">Start Annual ($99.99/yr)</a>
       </div>
     </div>
     ` : `
@@ -730,7 +817,7 @@ function renderDashboard(shopData, orders = [], fetchError = null, sessionToken 
         });
         const data = await res.json();
         if (data.success) {
-          toast.innerText = "Excel delivered successfully! (ID: " + data.emailId.slice(0, 8) + ")";
+          toast.innerText = "Excel delivered successfully! (ID: " + String(data.emailId || '').slice(0, 8) + ")";
         } else {
           toast.innerText = "Error: " + (data.error || 'Failed to send');
         }
@@ -850,13 +937,22 @@ function renderLegalPage(title, content) {
 // -------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 
-// Initialize Postgres cache and start scheduler
-(async () => {
+async function startServer() {
   try {
     await db.init();
     console.log('[OrderDrop] Database initialized successfully.');
   } catch (err) {
     console.error('[OrderDrop] DB init warning:', err.message);
+  }
+
+  // Only seed default shop AFTER db.init() has finished loading PostgreSQL records
+  if (!db.getShop(DEFAULT_SHOP)) {
+    db.saveShop(DEFAULT_SHOP, {
+      shop: DEFAULT_SHOP,
+      recipientEmail: process.env.MERCHANT_EMAIL || '',
+      plan: 'Starter ($9.99/mo)',
+      subscriptionStatus: 'active'
+    });
   }
 
   scheduler.startCron();
@@ -870,12 +966,19 @@ const PORT = process.env.PORT || 3000;
     const attrs = [{ name: 'commonName', value: 'localhost' }];
     const pems = selfsigned.generate(attrs, { days: 365 });
 
-    https.createServer({ key: pems.private, cert: pems.cert }, app).listen(3000, () => {
-      console.log(`[OrderDrop] HTTPS Server running at https://localhost:3000`);
+    https.createServer({ key: pems.private, cert: pems.cert }, app).listen(PORT, () => {
+      console.log(`[OrderDrop] HTTPS Server running at https://localhost:${PORT}`);
     });
 
-    http.createServer(app).listen(3001, () => {
-      console.log(`[OrderDrop] HTTP Server running at http://localhost:3001`);
+    const httpPort = process.env.HTTP_PORT || 3001;
+    http.createServer(app).listen(httpPort, () => {
+      console.log(`[OrderDrop] HTTP Server running at http://localhost:${httpPort}`);
     });
   }
-})();
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, startServer };

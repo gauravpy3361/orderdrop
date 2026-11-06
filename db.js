@@ -35,8 +35,12 @@ function persistLocal() {
 }
 
 async function persistPg(shopDomain, data) {
-  if (!pgPool) return;
+  if (!pgPool && !initPromise) return;
   try {
+    if (initPromise) {
+      await initPromise;
+    }
+    if (!pgPool) return;
     await pgPool.query(`
       INSERT INTO shops (shop, data, updated_at)
       VALUES ($1, $2, NOW())
@@ -48,8 +52,12 @@ async function persistPg(shopDomain, data) {
 }
 
 async function deletePg(shopDomain) {
-  if (!pgPool) return;
+  if (!pgPool && !initPromise) return;
   try {
+    if (initPromise) {
+      await initPromise;
+    }
+    if (!pgPool) return;
     await pgPool.query('DELETE FROM shops WHERE shop = $1;', [shopDomain]);
   } catch (err) {
     console.error(`[DB] Error deleting shop ${shopDomain} from PostgreSQL:`, err.message);
@@ -85,8 +93,10 @@ async function init() {
 
       const res = await pgPool.query('SELECT shop, data FROM shops;');
       for (const row of res.rows) {
-        shops[row.shop.toLowerCase().trim()] = row.data;
+        const key = row.shop.toLowerCase().trim();
+        shops[key] = { ...(shops[key] || {}), ...row.data };
       }
+      persistLocal();
       console.log(`[DB] Loaded ${res.rows.length} store(s) from persistent PostgreSQL.`);
       return shops;
     } catch (err) {
@@ -98,11 +108,18 @@ async function init() {
   return initPromise;
 }
 
-// Eagerly trigger init in background
-init().catch(() => {});
+async function close() {
+  if (pgPool) {
+    const pool = pgPool;
+    pgPool = null;
+    initPromise = null;
+    await pool.end().catch(() => {});
+  }
+}
 
 module.exports = {
   init,
+  close,
 
   getShop(domain) {
     if (!domain) return null;

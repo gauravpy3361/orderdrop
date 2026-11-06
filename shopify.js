@@ -12,6 +12,22 @@ function isValidShopDomain(shop) {
 }
 
 /**
+ * Timing-safe string comparison helper
+ */
+function timingSafeCompare(aStr, bStr) {
+  if (typeof aStr !== 'string' || typeof bStr !== 'string' || !aStr || !bStr) {
+    return false;
+  }
+  try {
+    const a = Buffer.from(aStr, 'utf8');
+    const b = Buffer.from(bStr, 'utf8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * Verify HMAC on incoming Shopify query params using timing-safe comparison
  */
 function verifyHmac(query, apiSecret) {
@@ -28,13 +44,7 @@ function verifyHmac(query, apiSecret) {
     .update(orderedParams)
     .digest('hex');
 
-  try {
-    const a = Buffer.from(calculatedHmac, 'utf8');
-    const b = Buffer.from(hmac, 'utf8');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch (err) {
-    return false;
-  }
+  return timingSafeCompare(calculatedHmac, String(hmac));
 }
 
 /**
@@ -47,11 +57,71 @@ function verifyWebhookHmac(rawBody, headerHmac, apiSecret) {
     .update(rawBody, 'utf8')
     .digest('base64');
 
+  return timingSafeCompare(calculatedHmac, String(headerHmac));
+}
+
+/**
+ * Create a cryptographically signed OAuth state parameter to prevent CSRF
+ */
+function createOAuthState(shop, apiSecret, ttlMs = 15 * 60 * 1000) {
+  const cleanShop = String(shop || '').toLowerCase().trim();
+  const expiresAt = Date.now() + ttlMs;
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const payload = `oauth_state:${cleanShop}:${expiresAt}:${nonce}`;
+  const sig = crypto.createHmac('sha256', apiSecret).update(payload).digest('hex');
+  return `${expiresAt}.${nonce}.${sig}`;
+}
+
+/**
+ * Verify cryptographically signed OAuth state parameter
+ */
+function verifyOAuthState(state, shop, apiSecret) {
+  if (!state || !shop || !apiSecret) return false;
+  const parts = String(state).split('.');
+  if (parts.length !== 3) return false;
+  const [expiresAtStr, nonce, sig] = parts;
+  const expiresAt = parseInt(expiresAtStr, 10);
+  if (isNaN(expiresAt) || Date.now() > expiresAt || !nonce) return false;
+
+  const cleanShop = String(shop).toLowerCase().trim();
+  const payload = `oauth_state:${cleanShop}:${expiresAtStr}:${nonce}`;
+  const expectedSig = crypto.createHmac('sha256', apiSecret).update(payload).digest('hex');
+  return timingSafeCompare(sig, expectedSig);
+}
+
+/**
+ * Verify Shopify App Bridge Session Token (HS256 JWT)
+ */
+function verifyAppBridgeJwt(jwtToken, clientId, clientSecret, expectedShop = null) {
+  if (!jwtToken || !clientSecret) return false;
+  const parts = String(jwtToken).replace(/^Bearer\s+/i, '').trim().split('.');
+  if (parts.length !== 3) return false;
+
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const expectedSig = crypto
+    .createHmac('sha256', clientSecret)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest('base64url');
+
+  if (!timingSafeCompare(signatureB64, expectedSig)) return false;
+
   try {
-    const a = Buffer.from(calculatedHmac, 'utf8');
-    const b = Buffer.from(headerHmac, 'utf8');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch (err) {
+    const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+    if (header.alg !== 'HS256') return false;
+
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (payload.exp && nowSec > payload.exp + 5) return false;
+    if (payload.nbf && nowSec + 5 < payload.nbf) return false;
+    if (clientId && payload.aud && payload.aud !== clientId) return false;
+
+    if (expectedShop && payload.dest) {
+      const cleanExpected = expectedShop.toLowerCase().trim();
+      const destHost = String(payload.dest).replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase().trim();
+      if (destHost !== cleanExpected) return false;
+    }
+    return true;
+  } catch (e) {
     return false;
   }
 }
@@ -60,8 +130,9 @@ function verifyWebhookHmac(rawBody, headerHmac, apiSecret) {
  * Create a cryptographic session signature for in-dashboard client API calls
  */
 function createSessionToken(shop, apiSecret, ttlMs = 24 * 60 * 60 * 1000) {
+  const cleanShop = String(shop || '').toLowerCase().trim();
   const expiresAt = Date.now() + ttlMs;
-  const payload = `${shop}:${expiresAt}`;
+  const payload = `${cleanShop}:${expiresAt}`;
   const sig = crypto.createHmac('sha256', apiSecret).update(payload).digest('hex');
   return `${expiresAt}.${sig}`;
 }
@@ -77,18 +148,13 @@ function verifySessionToken(token, shop, apiSecret) {
   const expiresAt = parseInt(expiresAtStr, 10);
   if (isNaN(expiresAt) || Date.now() > expiresAt) return false;
 
+  const cleanShop = String(shop).toLowerCase().trim();
   const expectedSig = crypto
     .createHmac('sha256', apiSecret)
-    .update(`${shop}:${expiresAtStr}`)
+    .update(`${cleanShop}:${expiresAtStr}`)
     .digest('hex');
 
-  try {
-    const a = Buffer.from(sig, 'utf8');
-    const b = Buffer.from(expectedSig, 'utf8');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch (e) {
-    return false;
-  }
+  return timingSafeCompare(sig, expectedSig);
 }
 
 /**
@@ -373,7 +439,8 @@ async function checkActiveSubscription(shop, accessToken) {
   if (!response.ok) return { hasActiveSubscription: false, subscriptions: [] };
 
   const result = await response.json();
-  const activeSubs = result.data?.currentAppInstallation?.activeSubscriptions || [];
+  const allSubs = result.data?.currentAppInstallation?.activeSubscriptions || [];
+  const activeSubs = allSubs.filter(s => !s.status || String(s.status).toUpperCase() === 'ACTIVE');
   return {
     hasActiveSubscription: activeSubs.length > 0,
     subscriptions: activeSubs
@@ -382,8 +449,12 @@ async function checkActiveSubscription(shop, accessToken) {
 
 module.exports = {
   isValidShopDomain,
+  timingSafeCompare,
   verifyHmac,
   verifyWebhookHmac,
+  createOAuthState,
+  verifyOAuthState,
+  verifyAppBridgeJwt,
   createSessionToken,
   verifySessionToken,
   exchangeCodeForToken,

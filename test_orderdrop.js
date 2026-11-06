@@ -1,8 +1,10 @@
 const assert = require('assert');
 const crypto = require('crypto');
+const http = require('http');
 const db = require('./db');
 const shopify = require('./shopify');
 const { generateOrdersWorkbook, sanitizeCell } = require('./export_engine');
+const { app } = require('./server');
 
 async function runTests() {
   console.log('--- [OrderDrop Test Suite] Starting Verification ---');
@@ -59,16 +61,13 @@ async function runTests() {
       shop: 'test-store.myshopify.com',
       timestamp: '1793552000'
     };
-    
-    // Sort keys and compute valid HMAC
+
     const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     const validHmac = crypto.createHmac('sha256', secret).update(sorted).digest('hex');
 
-    // Should pass
     const isValid = shopify.verifyHmac({ ...params, hmac: validHmac }, secret);
     assert.strictEqual(isValid, true);
 
-    // Altered params should fail
     const isInvalid = shopify.verifyHmac({ ...params, hmac: 'forged_hmac_signature' }, secret);
     assert.strictEqual(isInvalid, false);
   });
@@ -125,7 +124,6 @@ async function runTests() {
     assert.strictEqual(shopify.isValidShopDomain('hk-mart-cfoepmjd.myshopify.com'), true);
     assert.strictEqual(shopify.isValidShopDomain('store123.myshopify.com'), true);
 
-    // Attacks & invalid formats must fail
     assert.strictEqual(shopify.isValidShopDomain('evil.com'), false);
     assert.strictEqual(shopify.isValidShopDomain('my-store.myshopify.com.evil.com'), false);
     assert.strictEqual(shopify.isValidShopDomain('http://my-store.myshopify.com'), false);
@@ -143,15 +141,10 @@ async function runTests() {
     assert.strictEqual(typeof token, 'string');
     assert(token.includes('.'));
 
-    // Valid verification
-    const verified = shopify.verifySessionToken(token, shop, secret);
-    assert.strictEqual(verified, true);
+    assert.strictEqual(shopify.verifySessionToken(token, shop, secret), true);
 
-    // Tampered token must fail
     const tampered = token.slice(0, -4) + 'abcd';
     assert.strictEqual(shopify.verifySessionToken(tampered, shop, secret), false);
-
-    // Mismatched shop must fail
     assert.strictEqual(shopify.verifySessionToken(token, 'other-shop.myshopify.com', secret), false);
   });
 
@@ -164,15 +157,78 @@ async function runTests() {
     assert.strictEqual(sanitizeCell('\t=cmd'), "'\t=cmd");
     assert.strictEqual(sanitizeCell('\r=cmd'), "'\r=cmd");
 
-    // Standard benign strings remain untouched
     assert.strictEqual(sanitizeCell('#1001'), '#1001');
     assert.strictEqual(sanitizeCell('Yoga Mat Pro'), 'Yoga Mat Pro');
     assert.strictEqual(sanitizeCell(42), 42);
   });
 
+  // Test 9: Security - OAuth State Nonce CSRF Protection
+  test('Security: Cryptographic OAuth state nonce prevents CSRF & cross-shop replay', () => {
+    const secret = 'oauth_state_secret_999';
+    const shop = 'merchant-a.myshopify.com';
+    const state = shopify.createOAuthState(shop, secret);
+
+    assert.strictEqual(shopify.verifyOAuthState(state, shop, secret), true);
+    assert.strictEqual(shopify.verifyOAuthState(state, 'merchant-b.myshopify.com', secret), false);
+    assert.strictEqual(shopify.verifyOAuthState(state + 'x', shop, secret), false);
+
+    const expiredState = shopify.createOAuthState(shop, secret, -1000);
+    assert.strictEqual(shopify.verifyOAuthState(expiredState, shop, secret), false);
+  });
+
+  // Test 10: Security - Shopify App Bridge JWT Verification
+  test('Security: Verifies Shopify App Bridge HS256 JWT session tokens', () => {
+    const clientId = 'test_client_id';
+    const clientSecret = 'test_client_secret';
+    const shop = 'jwt-shop.myshopify.com';
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({
+      iss: `https://${shop}/admin`,
+      dest: `https://${shop}`,
+      aud: clientId,
+      exp: nowSec + 300,
+      nbf: nowSec - 5
+    })).toString('base64url');
+    const sig = crypto.createHmac('sha256', clientSecret).update(`${header}.${payload}`).digest('base64url');
+    const validJwt = `${header}.${payload}.${sig}`;
+
+    assert.strictEqual(shopify.verifyAppBridgeJwt(validJwt, clientId, clientSecret, shop), true);
+    assert.strictEqual(shopify.verifyAppBridgeJwt(validJwt, clientId, clientSecret, 'wrong-shop.myshopify.com'), false);
+    assert.strictEqual(shopify.verifyAppBridgeJwt(validJwt, 'wrong_client', clientSecret, shop), false);
+  });
+
+  // Test 11 & 12: Live Express Route Security Integration Tests
+  const server = http.createServer(app);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    await testAsync('Route Security: Unauthenticated GET /?shop=... is blocked (401) with zero token leak', async () => {
+      const res = await fetch(`${baseUrl}/?shop=hk-mart-cfoepmjd.myshopify.com`);
+      assert.strictEqual(res.status, 401, `Expected 401, got ${res.status}`);
+      const text = await res.text();
+      assert(!text.includes('const sessionToken ='), 'Must not mint or leak sessionToken on unauthenticated request');
+      assert(!text.includes('sunitajoshi98765'), 'Must not leak merchant email on unauthenticated request');
+    });
+
+    await testAsync('Route Security: Unauthenticated Billing endpoints (/subscribe & /confirm) are blocked (401)', async () => {
+      const subRes = await fetch(`${baseUrl}/api/billing/subscribe?shop=hk-mart-cfoepmjd.myshopify.com&plan=annual`);
+      assert.strictEqual(subRes.status, 401, `Expected 401 on /subscribe, got ${subRes.status}`);
+
+      const confRes = await fetch(`${baseUrl}/api/billing/confirm?shop=hk-mart-cfoepmjd.myshopify.com&plan=annual`);
+      assert.strictEqual(confRes.status, 401, `Expected 401 on /confirm, got ${confRes.status}`);
+    });
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+
   console.log('--- [Test Suite Summary] ---');
   console.log(`  Total: ${passed + failed} | Passed: ${passed} | Failed: ${failed}`);
-  if (failed > 0) process.exit(1);
+  await db.close();
+  if (failed > 0) process.exitCode = 1;
 }
 
 runTests();

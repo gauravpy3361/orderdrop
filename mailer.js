@@ -11,6 +11,16 @@ function getResend() {
   return resendInstance;
 }
 
+function escapeHtml(str) {
+  if (typeof str !== 'string') return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 /**
  * Send an Excel orders dispatch email via Resend
  * @param {Object} options
@@ -33,7 +43,10 @@ async function sendOrdersEmail({ to, shop, orderCount, excelBuffer, filename }) 
   }
 
   const cleanShop = shop.replace('.myshopify.com', '');
-  const subject = `📦 ${cleanShop} Daily Orders: ${orderCount} Unfulfilled Order(s) [${new Date().toISOString().split('T')[0]}]`;
+  const safeShop = escapeHtml(shop);
+  const safeFilename = escapeHtml(filename);
+  const safeCount = Number(orderCount) || 0;
+  const subject = `📦 ${cleanShop} Daily Orders: ${safeCount} Unfulfilled Order(s) [${new Date().toISOString().split('T')[0]}]`;
 
   const html = `
     <!DOCTYPE html>
@@ -54,18 +67,18 @@ async function sendOrdersEmail({ to, shop, orderCount, excelBuffer, filename }) 
           <h2 style="margin: 0; color: #0f172a; font-size: 20px;">📦 OrderDrop Daily Dispatch</h2>
           <span class="badge">Warehouse Ready</span>
         </div>
-        <p style="margin: 0 0 12px; color: #475569; font-size: 14px;">Here is the automated daily orders export for <strong>${shop}</strong>.</p>
+        <p style="margin: 0 0 12px; color: #475569; font-size: 14px;">Here is the automated daily orders export for <strong>${safeShop}</strong>.</p>
         
         <div class="summary-box">
           <div style="font-size: 14px; font-weight: 600; color: #0f172a;">Export Details</div>
-          <div style="font-size: 13px; color: #475569; margin-top: 6px;">Total Pending Orders: <strong>${orderCount} order(s)</strong></div>
-          <div style="font-size: 13px; color: #475569; margin-top: 4px;">Attached Workbook: <code>${filename}</code></div>
+          <div style="font-size: 13px; color: #475569; margin-top: 6px;">Total Pending Orders: <strong>${safeCount} order(s)</strong></div>
+          <div style="font-size: 13px; color: #475569; margin-top: 4px;">Attached Workbook: <code>${safeFilename}</code></div>
         </div>
 
         <p style="font-size: 13px; color: #64748b; line-height: 1.5; margin: 0;">The attached Excel spreadsheet has been formatted with standardized columns (Order #, SKU, Item Title, Quantity, Customer, and Shipping Address) for immediate pick-and-pack fulfillment.</p>
         
         <div class="footer">
-          Generated automatically by OrderDrop · <a href="https://orderdrop.onrender.com" style="color: #64748b;">OrderDrop SaaS</a>
+          Generated automatically by OrderDrop · <a href="https://orderdrop.store" style="color: #64748b;">OrderDrop SaaS</a>
         </div>
       </div>
     </body>
